@@ -68,6 +68,27 @@ def test_comprehension_and_lambda():
     assert "values" in d.uses and "f" in d.uses
 
 
+def test_comprehension_vars_not_external_uses():
+    # regression: elt was visited before the generator bound its target
+    d = analyze_source("cols = [c for c in df.columns if c != 'x']")
+    assert "c" not in d.uses and "df" in d.uses
+    d = analyze_source("nulls = {c: n for c, n in zip(a, b) if n > 0}")
+    assert "c" not in d.uses and "n" not in d.uses
+    assert {"a", "b"} <= d.uses
+
+
+def test_comprehension_vars_do_not_leak():
+    d = analyze_source("cols = [c for c in items]\nprint(c)")
+    assert "c" in d.uses  # the print(c) read is genuinely external
+
+
+def test_nested_multi_generator_comprehension():
+    src = "out = [f(x, y) for x in xs for y in ys(x) if y]"
+    d = analyze_source(src)
+    assert {"f", "xs", "ys"} <= d.uses
+    assert "x" not in d.uses and "y" not in d.uses
+
+
 def test_builtins_ignored():
     d = analyze_source("print(len(x))")
     assert d.uses == {"x"}

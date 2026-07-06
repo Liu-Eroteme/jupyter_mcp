@@ -231,6 +231,32 @@ class _ScopeVisitor(ast.NodeVisitor):
         self.deferred_uses |= free
         self.defined.add(node.name)
 
+    # -- comprehensions -------------------------------------------------------
+    # Generators must be visited before the element expression (evaluation
+    # order), and comprehension variables are scoped to the comprehension —
+    # they neither read from nor leak into the module scope.
+
+    def _visit_comprehension(self, node: ast.ListComp | ast.SetComp | ast.GeneratorExp | ast.DictComp) -> None:
+        temp_bound: set[str] = set()
+        for gen in node.generators:
+            self.visit(gen.iter)
+            before = set(self.defined)
+            self._bind_target(gen.target)
+            temp_bound |= self.defined - before
+            for cond in gen.ifs:
+                self.visit(cond)
+        if isinstance(node, ast.DictComp):
+            self.visit(node.key)
+            self.visit(node.value)
+        else:
+            self.visit(node.elt)
+        self.defined -= temp_bound
+
+    visit_ListComp = _visit_comprehension  # type: ignore[assignment]
+    visit_SetComp = _visit_comprehension  # type: ignore[assignment]
+    visit_GeneratorExp = _visit_comprehension  # type: ignore[assignment]
+    visit_DictComp = _visit_comprehension  # type: ignore[assignment]
+
     # -- expressions ---------------------------------------------------------
 
     def visit_Name(self, node: ast.Name) -> None:

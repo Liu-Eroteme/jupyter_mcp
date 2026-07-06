@@ -41,7 +41,11 @@ _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
 def slugify(text: str, max_len: int = 40) -> str:
     slug = _SLUG_RE.sub("-", text.lower()).strip("-")
-    return slug[:max_len].strip("-")
+    if len(slug) > max_len:
+        slug = slug[:max_len]
+        if "-" in slug:  # don't truncate mid-word
+            slug = slug.rsplit("-", 1)[0]
+    return slug.strip("-")
 
 
 def source_rev(source: str) -> str:
