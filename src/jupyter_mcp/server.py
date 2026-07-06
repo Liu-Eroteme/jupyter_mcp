@@ -341,9 +341,8 @@ def restart_kernel(path: str) -> str:
     cell becomes stale)."""
     session = registry.get(path)
     session.kernel().restart()
-    for ref in session.nbfile.refs():
-        cell_meta(ref.cell).pop("last_exec_rev", None)
-    session.nbfile.save()
+    # freshness is scoped to the kernel epoch, which just changed — no
+    # metadata rewrite needed for cells to read as stale
     return "Kernel restarted. All code cells are now stale."
 
 

@@ -53,15 +53,24 @@ class NotebookSession:
         )
 
     def stale_names(self, graph: NotebookGraph | None = None) -> list[str]:
-        """Code cells whose source changed since their last successful
-        execution, plus every downstream dependent — in document order."""
+        """Code cells whose *current kernel state* doesn't reflect their
+        source, plus every downstream dependent — in document order.
+
+        A cell counts as fresh only if it executed with its current source
+        (`last_exec_rev`) on the kernel that is alive right now
+        (`last_exec_epoch`). A new or restarted kernel has a different epoch,
+        so persisted metadata can never claim freshness against empty state.
+        """
         graph = graph or self.graph()
+        epoch = (
+            self._kernel.epoch if self._kernel is not None and self._kernel.alive else None
+        )
         changed = set()
         for ref in self.nbfile.refs():
             if ref.cell.cell_type != "code" or not ref.cell.source.strip():
                 continue
-            last = cell_meta(ref.cell).get("last_exec_rev")
-            if last != ref.rev:
+            meta = cell_meta(ref.cell)
+            if meta.get("last_exec_rev") != ref.rev or meta.get("last_exec_epoch") != epoch or epoch is None:
                 changed.add(ref.name)
         stale = graph.stale_closure(changed)
         code_names = {
@@ -103,6 +112,7 @@ class NotebookSession:
         self.guard_mutation()
         self.nbfile.snapshot(f"execute-{ordered[0]}" if ordered else "execute")
         kernel = self.kernel()
+        kernel.ensure_started()  # epoch must exist before stamping freshness
 
         results: list[tuple[str, str, Condensed]] = []
         failed = False
@@ -119,6 +129,7 @@ class NotebookSession:
                 condensed.text = f"[{res.note}]\n{condensed.text}"
             if res.status == "ok":
                 cell_meta(ref.cell)["last_exec_rev"] = ref.rev
+                cell_meta(ref.cell)["last_exec_epoch"] = kernel.epoch
             else:
                 failed = True
             results.append((name, res.status, condensed))

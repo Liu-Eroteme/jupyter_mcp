@@ -118,6 +118,38 @@ def test_execute_returns_image(nb):
 
 
 @pytest.mark.kernel
+def test_staleness_scoped_to_kernel_epoch(nb, tmp_path):
+    """Regression: persisted freshness must not survive into a NEW kernel.
+
+    Found while dogfooding: a fresh server process trusted last_exec_rev from
+    a previous process's kernel, so run_stale executed a 'minimal' set
+    against an empty kernel and hit NameError on upstream variables.
+    """
+    from jupyter_mcp.session import NotebookSession
+    from jupyter_mcp.summaries import Summarizer
+
+    server.add_cell(str(nb), "load", "data = [1, 2]")
+    server.add_cell(str(nb), "use", "print(sum(data))")
+    server.run_stale(str(nb))
+    # same session + live kernel: nothing stale
+    assert server.registry.get(str(nb)).stale_names() == []
+
+    # simulate a new server process: fresh session, no kernel started
+    fresh = NotebookSession(nb, Summarizer())
+    assert fresh.stale_names() == ["load", "use"]
+
+    # and executing through the fresh session must include upstream cells
+    results = fresh.execute_cells(fresh.stale_names())
+    try:
+        assert [(name, status) for name, status, _ in results] == [
+            ("load", "ok"),
+            ("use", "ok"),
+        ]
+    finally:
+        fresh.shutdown_kernel()
+
+
+@pytest.mark.kernel
 def test_restart_kernel_marks_all_stale(nb):
     server.add_cell(str(nb), "setup", "x = 1")
     server.execute_cells(str(nb), names=["setup"])

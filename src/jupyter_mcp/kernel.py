@@ -9,10 +9,12 @@ whole-notebook re-runs.
 from __future__ import annotations
 
 import queue
+import subprocess
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from jupyter_client.kernelspec import KernelSpecManager, NoSuchKernel
+from jupyter_client.kernelspec import KernelSpec, KernelSpecManager, NoSuchKernel
 from jupyter_client.manager import KernelManager
 from nbformat.v4 import output_from_msg
 
@@ -20,6 +22,8 @@ from .errors import KernelError
 
 STARTUP_TIMEOUT = 60.0
 DEFAULT_EXEC_TIMEOUT = 120.0
+_VENV_KERNEL = "__jupyter_mcp_project_venv__"
+_MAX_VENV_WALK = 8
 
 
 @dataclass
@@ -30,8 +34,65 @@ class ExecResult:
     note: str = ""
 
 
+def find_project_python(notebook_path: Path) -> Path | None:
+    """Locate the notebook's project interpreter (a nearby venv with ipykernel).
+
+    The server process runs in its own environment — resolving the default
+    `python3` kernelspec would start a kernel that can't import the project's
+    libraries. Like an editor, prefer the project venv: walk up from the
+    notebook directory looking for `.venv`/`venv`, stopping at a git root.
+    """
+    parents = [notebook_path.parent, *notebook_path.parent.parents][:_MAX_VENV_WALK]
+    for parent in parents:
+        for venv_name in (".venv", "venv"):
+            for rel in ("bin/python", "Scripts/python.exe"):
+                candidate = parent / venv_name / rel
+                if candidate.exists() and _has_ipykernel(candidate):
+                    return candidate
+        if (parent / ".git").exists():
+            break
+    return None
+
+
+def _has_ipykernel(python: Path) -> bool:
+    try:
+        subprocess.run(
+            [str(python), "-c", "import ipykernel"],
+            check=True,
+            capture_output=True,
+            timeout=30,
+        )
+        return True
+    except Exception:
+        return False
+
+
+class _StaticSpecManager(KernelSpecManager):
+    """Serves one synthetic kernelspec (the project venv) by a reserved name."""
+
+    def __init__(self, spec: KernelSpec, **kwargs):
+        super().__init__(**kwargs)
+        self._static_spec = spec
+
+    def get_kernel_spec(self, kernel_name: str) -> KernelSpec:
+        if kernel_name == _VENV_KERNEL:
+            return self._static_spec
+        return super().get_kernel_spec(kernel_name)
+
+
+def _venv_kernel_manager(python: Path) -> KernelManager:
+    spec = KernelSpec(
+        argv=[str(python), "-m", "ipykernel_launcher", "-f", "{connection_file}"],
+        display_name=f"project venv ({python})",
+        language="python",
+    )
+    return KernelManager(
+        kernel_name=_VENV_KERNEL, kernel_spec_manager=_StaticSpecManager(spec)
+    )
+
+
 def resolve_kernel_name(requested: str | None) -> tuple[str, str]:
-    """Return (kernel_name, note). Falls back to python3 if unavailable."""
+    """Return (kernel_name, note) among installed specs. Fallback: python3."""
     specs = KernelSpecManager().find_kernel_specs()
     if requested and requested in specs:
         return requested, ""
@@ -50,6 +111,9 @@ class KernelSession:
         self.requested_kernel = kernel_name
         self.kernel_name: str | None = None
         self.note = ""
+        #: identifies one live kernel's state; changes on every (re)start so
+        #: persisted staleness metadata can't outlive the state it describes
+        self.epoch: str | None = None
         self._km: KernelManager | None = None
         self._kc = None
 
@@ -58,9 +122,20 @@ class KernelSession:
         return self._km is not None and self._km.is_alive()
 
     def start(self) -> None:
-        self.kernel_name, self.note = resolve_kernel_name(self.requested_kernel)
-        try:
+        # A specifically-named kernelspec is honored; the generic default
+        # ("python3"/unset) prefers the notebook's project venv, so imports
+        # resolve like they do in the user's editor.
+        km: KernelManager | None = None
+        if self.requested_kernel in (None, "", "python3"):
+            python = find_project_python(self.notebook_path)
+            if python is not None:
+                km = _venv_kernel_manager(python)
+                self.kernel_name = _VENV_KERNEL
+                self.note = f"using project venv interpreter: {python}"
+        if km is None:
+            self.kernel_name, self.note = resolve_kernel_name(self.requested_kernel)
             km = KernelManager(kernel_name=self.kernel_name)
+        try:
             km.start_kernel(cwd=str(self.notebook_path.parent))
         except NoSuchKernel as e:
             raise KernelError(f"Cannot start kernel {self.kernel_name!r}: {e}") from e
@@ -72,6 +147,7 @@ class KernelSession:
             km.shutdown_kernel(now=True)
             raise KernelError(f"Kernel {self.kernel_name!r} did not become ready: {e}") from e
         self._km, self._kc = km, kc
+        self.epoch = uuid.uuid4().hex[:12]
 
     def ensure_started(self) -> None:
         if not self.alive:
@@ -82,6 +158,7 @@ class KernelSession:
         if self._km is not None and self._km.is_alive():
             self._km.restart_kernel(now=True)
             self._kc.wait_for_ready(timeout=STARTUP_TIMEOUT)
+            self.epoch = uuid.uuid4().hex[:12]
         else:
             self.ensure_started()
 
