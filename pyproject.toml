@@ -1,0 +1,33 @@
+[project]
+name = "jupyter-mcp"
+version = "0.1.0"
+description = "Kernel-attached MCP server for Jupyter EDA workflows: named cells, dependency DAG, condensed outputs, lazy LLM summaries"
+readme = "README.md"
+authors = [
+    { name = "Liu Staller-Hellmann", email = "liu@hellmann.cc" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "anthropic>=0.116.0",
+    "ipykernel>=7.3.0",
+    "jupyter-client>=8.9.1",
+    "mcp>=1.28.1",
+    "nbformat>=5.10.4",
+    "pillow>=12.3.0",
+]
+
+[project.scripts]
+jupyter-mcp = "jupyter_mcp.server:main"
+
+[build-system]
+requires = ["uv_build>=0.11.26,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["kernel: starts a real Jupyter kernel (slower)"]
