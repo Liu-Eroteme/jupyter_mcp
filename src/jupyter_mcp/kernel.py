@@ -25,6 +25,7 @@ from jupyter_client.manager import KernelManager
 from nbformat.v4 import output_from_msg
 
 from .errors import KernelError
+from .tasks import OutputBuffer
 
 STARTUP_TIMEOUT = 60.0
 DEFAULT_EXEC_TIMEOUT = 120.0
@@ -218,21 +219,29 @@ class KernelSession:
 
     # ------------------------------------------------------------ execution
 
-    def execute(self, code: str, timeout: float = DEFAULT_EXEC_TIMEOUT) -> ExecResult:
-        """Run code, collecting outputs as nbformat output dicts."""
+    def execute(
+        self,
+        code: str,
+        timeout: float = DEFAULT_EXEC_TIMEOUT,
+        buffer: OutputBuffer | None = None,
+    ) -> ExecResult:
+        """Run code, accumulating outputs into `buffer` as they arrive.
+
+        Passing a shared buffer gives other threads a live mid-run view;
+        without one the call is plain synchronous collection.
+        """
         self.ensure_started()
         self.last_used = time.monotonic()
         kc = self._kc
         if kc is None:  # unreachable after ensure_started; narrows the type
             raise KernelError("Kernel client unavailable.")
+        buffer = buffer if buffer is not None else OutputBuffer()
         msg_id = kc.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
 
-        outputs: list[dict] = []
         execution_count: int | None = None
         status = "ok"
         note = ""
         idle = False
-        pending_clear = False
 
         while not idle:
             try:
@@ -262,14 +271,8 @@ class KernelSession:
             elif mtype == "execute_input":
                 execution_count = content.get("execution_count", execution_count)
             elif mtype == "clear_output":
-                if content.get("wait"):
-                    pending_clear = True
-                else:
-                    outputs.clear()
+                buffer.clear(wait=bool(content.get("wait")))
             elif mtype in ("stream", "display_data", "execute_result", "error"):
-                if pending_clear:
-                    outputs.clear()
-                    pending_clear = False
                 try:
                     out = output_from_msg(msg)
                 except ValueError:
@@ -278,7 +281,7 @@ class KernelSession:
                     status = "error"
                 if mtype == "execute_result":
                     execution_count = content.get("execution_count", execution_count)
-                outputs.append(dict(out))
+                buffer.add(dict(out))
 
         # consume the shell reply so the channel stays clean
         try:
@@ -288,12 +291,14 @@ class KernelSession:
         except queue.Empty:
             pass
 
-        return ExecResult(status=status, outputs=outputs, execution_count=execution_count, note=note)
+        return ExecResult(
+            status=status, outputs=buffer.snapshot(), execution_count=execution_count, note=note
+        )
 
 
 INSPECT_HELPER = r'''
 def __jmcp_inspect__(name):
-    import reprlib
+    import contextlib
     g = globals()
     if name not in g:
         print(f"NameError: {name!r} is not defined in the kernel")
@@ -303,35 +308,45 @@ def __jmcp_inspect__(name):
     print(f"type: {t.__module__}.{t.__qualname__}")
     for attr in ("shape",):
         if hasattr(obj, attr):
-            try:
+            with contextlib.suppress(Exception):
                 print(f"{attr}: {getattr(obj, attr)}")
-            except Exception:
-                pass
     if hasattr(obj, "schema") and not callable(getattr(obj, "schema", None)):
-        try:
+        with contextlib.suppress(Exception):
             print(f"schema: {obj.schema}")
-        except Exception:
-            pass
     elif hasattr(obj, "dtypes") and hasattr(obj, "columns"):
-        try:
+        with contextlib.suppress(Exception):
             cols = list(obj.columns)
             print(f"columns ({len(cols)}): {cols}")
             print(f"dtypes: {list(map(str, obj.dtypes))}")
+    with contextlib.suppress(Exception):
+        print(f"len: {len(obj)}")
+
+    # rich view: publish the object's full mime bundle (all _repr_*_ forms);
+    # the server picks the best one — html tables condense to CSV, figures
+    # come back as images, everything else falls back to (pretty) repr
+    head = obj
+    if hasattr(obj, "head") and callable(getattr(obj, "head", None)):
+        with contextlib.suppress(Exception):
+            head = obj.head(10)
+    with contextlib.ExitStack() as stack:
+        root_mod = t.__module__.split(".")[0]
+        if root_mod == "polars":
+            with contextlib.suppress(Exception):
+                import polars as _pl
+                stack.enter_context(_pl.Config(tbl_cols=-1))
+        elif root_mod == "pandas":
+            with contextlib.suppress(Exception):
+                import pandas as _pd
+                stack.enter_context(_pd.option_context("display.max_columns", None))
+        try:
+            from IPython.display import display
+            display(head)
         except Exception:
-            pass
-    try:
-        n = len(obj)
-        print(f"len: {n}")
-    except Exception:
-        pass
-    r = reprlib.Repr()
-    r.maxstring = 800
-    r.maxother = 2000
-    try:
-        head = obj.head(5) if hasattr(obj, "head") and callable(obj.head) else obj
-        print(repr(head)[:2500])
-    except Exception:
-        print(r.repr(obj))
+            import reprlib
+            r = reprlib.Repr()
+            r.maxstring = 800
+            r.maxother = 2500
+            print(r.repr(obj))
 '''
 
 

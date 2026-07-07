@@ -90,8 +90,13 @@ def _render_cell(
         lines.append("source:")
         lines.append(ref.cell.source if ref.cell.source.strip() else "(empty)")
     if view in ("full", "outputs") and ref.cell.cell_type == "code":
-        condensed = condense_outputs(ref.cell.get("outputs", []))
-        lines.append("output:")
+        running = session.running_task(ref.name)
+        if running is not None:
+            condensed = condense_outputs(running.buffer.snapshot())
+            lines.append(f"output (running for {running.elapsed():.0f}s — so far):")
+        else:
+            condensed = condense_outputs(ref.cell.get("outputs", []))
+            lines.append("output:")
         lines.append(condensed.text)
         images = [Image(data=png, format="png") for png in condensed.images]
     return "\n".join(lines), images
@@ -161,12 +166,26 @@ def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
             session.nbfile.save()
         notice = result.notice
     stale = set(session.stale_names(graph))
+    current, queued_names = session.activity()
+    queued = set(queued_names)
+    kernel_line = session.kernel_status()
+    if current is not None:
+        kernel_line += f" — busy: {current.name!r} running for {current.elapsed():.0f}s"
+        if queued_names:
+            kernel_line += f", {len(queued_names)} queued"
     lines = [
         f"# {session.path} — {len(session.nbfile.cells)} cells",
-        f"kernel: {session.kernel_status()}",
+        f"kernel: {kernel_line}",
     ]
     for ref in session.nbfile.refs():
-        marker = " STALE" if ref.name in stale else ""
+        if current is not None and ref.name == current.name:
+            marker = " RUNNING"
+        elif ref.name in queued:
+            marker = " QUEUED"
+        elif ref.name in stale:
+            marker = " STALE"
+        else:
+            marker = ""
         lines.append(
             f"[{ref.index:>2}] {ref.name}  (rev {ref.rev}; {ref.cell.cell_type}{marker})"
         )
@@ -229,7 +248,7 @@ def _after_mutation(session: NotebookSession, header: str, focus: str, run: str)
         stale = session.stale_names()
         if not stale:
             return f"{header}\nNothing is stale — no cells executed."
-        blocks = _render_exec_results(session, session.execute_cells(stale))
+        blocks = _run_and_render(session, stale, timeout_seconds=120, quiet=False, wait_seconds=60)
         if blocks and isinstance(blocks[0], str):
             blocks[0] = f"{header}\n\n{blocks[0]}"
         else:
@@ -314,33 +333,90 @@ def move_cell(
 
 @mcp.tool()
 @_tool_errors
-def execute_cells(
-    path: str, names: list[str], timeout_seconds: float = 120, quiet: bool = False
+def run(
+    path: str,
+    cells: list[str] | None = None,
+    fresh_deps: bool = True,
+    timeout_seconds: float = 120,
+    quiet: bool = False,
+    wait_seconds: float = 60,
 ) -> list:
-    """Execute the named code cells (in document order) on the notebook's
-    persistent kernel. Outputs are written to the file and returned condensed;
-    charts come back as images. Execution stops at the first failing cell.
-    `quiet` collapses successful cells to one status line each (errors and
-    images always come through in full)."""
+    """Execute cells on the notebook's persistent kernel.
+
+    Default (no `cells`): every stale cell in document order — minimal
+    recompute after edits. With `cells`: exactly those cells, even if fresh
+    (API calls, randomness), preceded by their stale ancestors so inputs are
+    trustworthy (`fresh_deps=false` skips the ancestor pass). Outputs are
+    persisted and returned condensed; charts come back as images; `quiet`
+    collapses ok cells to status lines. If everything finishes within
+    `wait_seconds` you get full results; otherwise execution continues in the
+    background — watch it via notebook_overview / read_cells (live output),
+    stop it via interrupt."""
     session = registry.get(path)
-    results = session.execute_cells(names, timeout=timeout_seconds)
-    return _render_exec_results(session, results, quiet=quiet)
+    session.refresh_reads()
+    graph = session.graph()
+    stale = session.stale_names(graph)
+    if cells is None:
+        if not stale:
+            return ["Nothing is stale — all code cells are up to date."]
+        targets = stale
+    else:
+        known = {r.name for r in session.nbfile.refs()}
+        for c in cells:
+            if c not in known:
+                from .errors import CellNotFound
+
+                raise CellNotFound(c, sorted(known))
+        wanted = set(cells)
+        if fresh_deps:
+            upstream: set[str] = set()
+            for c in cells:
+                upstream |= graph.ancestors(c)
+            wanted |= upstream & set(stale)
+        targets = [r.name for r in session.nbfile.refs() if r.name in wanted]
+    return _run_and_render(session, targets, timeout_seconds, quiet, wait_seconds)
 
 
 @mcp.tool()
 @_tool_errors
-def run_stale(path: str, timeout_seconds: float = 120, quiet: bool = False) -> list:
-    """Execute every stale cell (changed since last run, plus dependents) in
-    document order. The minimal-recompute alternative to re-running the whole
-    notebook. `quiet` collapses successful cells to one status line each
-    (errors and images always come through in full)."""
+def interrupt(path: str, clear_queue: bool = True) -> str:
+    """Interrupt the currently running cell (KeyboardInterrupt in the kernel)
+    and cancel queued cells. Kernel state (variables) survives; interrupted
+    cells read as stale until a successful re-run."""
     session = registry.get(path)
-    session.refresh_reads()
-    stale = session.stale_names()
-    if not stale:
-        return ["Nothing is stale — all code cells are up to date."]
-    results = session.execute_cells(stale, timeout=timeout_seconds)
-    return _render_exec_results(session, results, quiet=quiet)
+    return session.interrupt(clear_queue)
+
+
+def _run_and_render(
+    session: NotebookSession,
+    names: list[str],
+    timeout_seconds: float,
+    quiet: bool,
+    wait_seconds: float,
+) -> list:
+    batch = session.submit_cells(names, timeout=timeout_seconds)
+    if batch.wait(wait_seconds):
+        return _render_exec_results(session, session.batch_results(batch), quiet=quiet)
+    return [_progress_snapshot(batch, wait_seconds)]
+
+
+def _progress_snapshot(batch, waited: float) -> str:
+    lines = [f"Still running after the {waited:.0f}s check-in — execution continues in the background."]
+    for t in batch.tasks:
+        if t.status == "running":
+            last = t.buffer.last_line()
+            tail = f" — last output: {last}" if last else ""
+            lines.append(f"running: {t.name} ({t.elapsed():.0f}s){tail}")
+    queued = [t.name for t in batch.tasks if t.status == "queued"]
+    if queued:
+        lines.append(f"queued: {', '.join(queued)}")
+    done = [(t.name, t.status) for t in batch.tasks if t.done.is_set()]
+    if done:
+        lines.append("finished: " + ", ".join(f"{n} ({s})" for n, s in done))
+    lines.append(
+        "Watch progress with notebook_overview / read_cells (live output so far); stop with interrupt."
+    )
+    return "\n".join(lines)
 
 
 def _render_exec_results(
@@ -378,6 +454,8 @@ def restart_kernel(path: str) -> str:
     """Restart the notebook's kernel (all in-memory state is lost; every code
     cell becomes stale)."""
     session = registry.get(path)
+    if session.busy():
+        raise JupyterMcpError("Kernel is busy (cell running or queued). interrupt first, then restart.")
     session.kernel().restart()
     # freshness is scoped to the kernel epoch, which just changed — no
     # metadata rewrite needed for cells to read as stale
@@ -386,13 +464,18 @@ def restart_kernel(path: str) -> str:
 
 @mcp.tool()
 @_tool_errors
-def inspect_variable(path: str, variable: str, timeout_seconds: float = 30) -> str:
-    """Inspect a live variable in the kernel: type, shape/schema/columns,
-    length, and a truncated repr — without adding a cell."""
+def inspect_variable(path: str, variable: str, timeout_seconds: float = 30) -> list:
+    """Inspect a live kernel variable without adding a cell: type, shape,
+    schema/columns, length, plus its richest Jupyter repr — dataframes
+    condense to a CSV table, figures come back as images, everything else
+    falls back to a (pretty) repr."""
     session = registry.get(path)
-    res = session.kernel().execute(inspect_code(variable), timeout=timeout_seconds)
-    condensed = condense_outputs(res.outputs)
-    return condensed.text
+    task = session.run_adhoc(inspect_code(variable), timeout=timeout_seconds)
+    condensed = condense_outputs(task.buffer.snapshot())
+    text = f"[{task.note}]\n{condensed.text}" if task.note else condensed.text
+    blocks: list = [text]
+    blocks.extend(Image(data=png, format="png") for png in condensed.images)
+    return blocks
 
 
 @mcp.tool()
@@ -400,6 +483,8 @@ def inspect_variable(path: str, variable: str, timeout_seconds: float = 30) -> s
 def undo_last(path: str) -> str:
     """Restore the notebook to its state before the most recent mutation."""
     session = registry.get(path)
+    if session.busy():
+        raise JupyterMcpError("Cannot undo while cells are running or queued. interrupt first.")
     # an undo overwrites the file — external edits void it like any mutation
     session.guard_mutation()
     op = session.nbfile.undo_last()

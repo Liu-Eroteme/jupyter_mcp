@@ -27,6 +27,7 @@ from html.parser import HTMLParser
 _ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[a-zA-Z]")
 
 MAX_OUTPUT_CHARS = 4000
+MAX_HTML_PARSE_CHARS = 1_000_000
 MAX_TRACEBACK_LINES = 40
 MAX_TABLE_ROWS = 50
 MAX_IMAGE_DIM = 1200
@@ -167,7 +168,8 @@ def _mime_bundle_text(data: dict, images: list[bytes]) -> str | None:
         html = data["text/html"]
         if isinstance(html, list):
             html = "".join(html)
-        if "<table" in html:
+        # size guard: a styled mega-frame can emit megabytes of HTML
+        if "<table" in html and len(html) <= MAX_HTML_PARSE_CHARS:
             table = html_table_to_text(html)
             if table is not None:
                 return table

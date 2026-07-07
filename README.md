@@ -21,8 +21,9 @@ This server fixes each of those with an opinionated data model.
 |---|---|
 | **Cell names** | Every cell has a unique kebab-case name stored in `cell.metadata.jupyter_mcp.name`. Unnamed cells get auto-names from their first comment/heading. |
 | **Revisions** | Each cell has a short content hash (`rev`). Every mutation requires the `expected_rev` from your latest read — optimistic locking that makes wrong-target and stale edits structurally impossible. No confirmation round-trips. |
-| **Dependency DAG** | A static AST pass (not runtime tracing) extracts per-cell defines/uses/mutations and builds last-writer-wins edges. Works on unexecuted cells, which is the whole point: edit first, then `run_stale`. |
-| **Staleness** | A cell is fresh only if its *current source* ran on the *currently live kernel* (freshness is stamped with a per-kernel epoch). Source edits make a cell and its dependents stale; a new or restarted kernel makes everything stale — persisted metadata can never claim freshness against empty kernel state. `run_stale` executes exactly the stale set, in document order. |
+| **Dependency DAG** | A static AST pass (not runtime tracing) extracts per-cell defines/uses/mutations and builds last-writer-wins edges. Works on unexecuted cells, which is the whole point: edit first, then `run`. |
+| **Staleness** | A cell is fresh only if its *current source* ran on the *currently live kernel* (freshness is stamped with a per-kernel epoch). Source edits make a cell and its dependents stale; a new or restarted kernel makes everything stale — persisted metadata can never claim freshness against empty kernel state. `run` executes exactly the stale set, in document order. |
+| **Background execution** | Every run goes through a per-notebook executor thread. `run` waits a bounded time (default 60 s); anything longer keeps executing while outputs accumulate in a live buffer — the overview shows RUNNING/QUEUED, `read_cells` returns output-so-far, `interrupt` stops it. Oversized output keeps head+tail with explicit dropped markers. |
 | **Condensed outputs** | Streams merged, ANSI stripped, long text truncated head+tail with explicit markers. Duplicate table reprs collapse to one: uniform → CSV, ragged → JSON. Charts return as real MCP images (downscaled), so the agent *sees* them. |
 | **Summaries** | Lazy, batched `claude-haiku-4-5` summaries (tldr + description + output summary) cached in cell metadata keyed by content hash. Unchanged cells are never re-summarized. Degrades to deterministic fallbacks (marked `*`) without API credentials. |
 | **Snapshots / undo** | Every mutation snapshots the file first (under `~/.cache/jupyter_mcp/`); `undo_last` restores it. |
@@ -35,10 +36,10 @@ This server fixes each of those with an opinionated data model.
 | `notebook_overview` | Index: names, revs, staleness, tldrs, edges, lint |
 | `read_cells` | Full cells (code + condensed outputs + images), by names/slice |
 | `add_cell` / `update_cell` / `remove_cell` / `move_cell` | Mutations; all take `expected_rev`; add/update accept `run="stale"` to fold the edit→run loop into one call |
-| `execute_cells` | Run named cells on the persistent kernel (`quiet` collapses ok cells to status lines) |
-| `run_stale` | Minimal re-execution after edits (`quiet` supported) |
+| `run` | Default: all stale cells (minimal recompute). With `cells`: exactly those, even if fresh, after freshening their stale ancestors (`fresh_deps`). Bounded wait; continues in background |
+| `interrupt` | Stop the running cell (KeyboardInterrupt), cancel the queue |
 | `restart_kernel` | Fresh kernel; marks everything stale |
-| `inspect_variable` | Type/shape/schema/head of a live variable, no cell needed |
+| `inspect_variable` | Type/shape/schema of a live variable plus its richest repr: dataframes as CSV, figures as images, else pretty repr |
 | `undo_last` | Restore pre-mutation snapshot |
 | `summarize_cells` | Detailed LLM summaries incl. outputs |
 | `search_cells` | Search source + names + summaries |

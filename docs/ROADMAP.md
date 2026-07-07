@@ -61,11 +61,11 @@ signal_timestamp"*. Each was rediscovered from scratch during EDA.
 - **Retrieval & reranking** over the KB driven by notebook session context
   (only if plain matching proves insufficient).
 - **Runtime-verified DAG edges** as a refinement layer on top of the static
-  pass (e.g. namespace diffing around `execute_cells` — cheap, no ipyflow).
-- **Cross-process undo**: persist the undo stack index so a restarted server
-  can offer existing snapshots.
-- **Cell-level diff tool** (`diff_cell(name, proposed_source)`) for
-  previewing edits without applying.
+  pass (e.g. namespace diffing around execution — cheap, no ipyflow).
+- ~~**Cross-process undo**~~ — done: the undo stack is seeded from on-disk
+  snapshots.
+- ~~**Cell-level diff tool**~~ — rejected: revision locking already prevents
+  blind overwrites, and the agent holds both source versions anyway.
 - **Notebook lint tool** as a first-class surface (currently footer notes):
   use-before-def, unused definitions, opaque cells, missing names.
 - **Export tools**: notebook → script / HTML report.
