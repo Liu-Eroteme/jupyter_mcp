@@ -261,6 +261,8 @@ class NotebookFile:
             if ref.cell.cell_type == "code":
                 ref.cell.outputs = []
                 ref.cell.execution_count = None
+                # the cached output summary describes outputs that no longer exist
+                cell_meta(ref.cell).pop("output_summary", None)
         return CellRef(ref.index, ref.cell)
 
     def remove_cell(self, name: str, expected_rev: str) -> None:
@@ -275,9 +277,15 @@ class NotebookFile:
         index: int | None = None,
     ) -> CellRef:
         ref = self.check_rev(name, expected_rev)
-        cell = self.nb.cells.pop(ref.index)
+        # validate the full request BEFORE popping — a rejected move must not
+        # leave the in-memory model missing the cell
         if after == name:
             raise JupyterMcpError("Cannot move a cell after itself.")
+        if after is not None and index is not None:
+            raise JupyterMcpError("Pass either 'after' or 'index', not both.")
+        if after:  # "" is the prepend sentinel
+            self.get(after)
+        cell = self.nb.cells.pop(ref.index)
         pos = self._resolve_insert_index(after, index)
         self.nb.cells.insert(pos, cell)
         return CellRef(pos, cell)

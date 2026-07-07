@@ -16,6 +16,7 @@ from __future__ import annotations
 import hashlib
 import os
 from dataclasses import dataclass
+from typing import TypeVar
 
 from pydantic import BaseModel
 
@@ -26,6 +27,13 @@ SUMMARY_MODEL = "claude-haiku-4-5"
 DISABLE_ENV = "JUPYTER_MCP_DISABLE_SUMMARIES"
 MAX_CODE_CHARS_PER_CELL = 3000
 MAX_OUTPUT_CHARS_PER_CELL = 2000
+
+_TModel = TypeVar("_TModel", bound=BaseModel)
+
+
+def output_hash(condensed_text: str) -> str:
+    """Cache key tying an output_summary to the condensed output it describes."""
+    return hashlib.sha256(condensed_text.encode()).hexdigest()[:10]
 
 
 class CellSummary(BaseModel):
@@ -100,7 +108,7 @@ class Summarizer:
             self._client = anthropic.Anthropic()
         return self._client
 
-    def _parse(self, prompt: str, output_format):
+    def _parse(self, prompt: str, output_format: type[_TModel]) -> _TModel:
         client = self._get_client()
         response = client.messages.parse(
             model=SUMMARY_MODEL,
@@ -108,6 +116,8 @@ class Summarizer:
             messages=[{"role": "user", "content": prompt}],
             output_format=output_format,
         )
+        if response.parsed_output is None:
+            raise ValueError("model returned no parsed output")
         return response.parsed_output
 
     # -- code summaries --------------------------------------------------------
@@ -208,7 +218,7 @@ class Summarizer:
         todo: list[tuple[str, str, str]] = []
         for name, text in items:
             ref = nbfile.get(name)
-            ohash = hashlib.sha256(text.encode()).hexdigest()[:10]
+            ohash = output_hash(text)
             existing = cell_meta(ref.cell).get("output_summary")
             if existing and existing.get("output_hash") == ohash:
                 continue

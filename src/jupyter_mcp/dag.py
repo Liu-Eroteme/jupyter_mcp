@@ -297,38 +297,38 @@ def _free_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.
     loaded: set[str] = set()
 
     class Inner(ast.NodeVisitor):
-        def visit_Name(self, n: ast.Name) -> None:
-            if isinstance(n.ctx, ast.Load):
-                loaded.add(n.id)
+        def visit_Name(self, node: ast.Name) -> None:
+            if isinstance(node.ctx, ast.Load):
+                loaded.add(node.id)
             else:
-                bound.add(n.id)
+                bound.add(node.id)
 
-        def visit_FunctionDef(self, n: ast.FunctionDef) -> None:
-            bound.add(n.name)
-            self._nested(n)
+        def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+            bound.add(node.name)
+            self._nested(node)
 
         visit_AsyncFunctionDef = visit_FunctionDef  # type: ignore[assignment]
 
-        def visit_Lambda(self, n: ast.Lambda) -> None:
-            self._nested(n)
+        def visit_Lambda(self, node: ast.Lambda) -> None:
+            self._nested(node)
 
-        def visit_ClassDef(self, n: ast.ClassDef) -> None:
-            bound.add(n.name)
-            self.generic_visit(n)
+        def visit_ClassDef(self, node: ast.ClassDef) -> None:
+            bound.add(node.name)
+            self.generic_visit(node)
 
-        def visit_Import(self, n: ast.Import) -> None:
-            for alias in n.names:
+        def visit_Import(self, node: ast.Import) -> None:
+            for alias in node.names:
                 bound.add(alias.asname or alias.name.split(".")[0])
 
-        def visit_ImportFrom(self, n: ast.ImportFrom) -> None:
-            for alias in n.names:
+        def visit_ImportFrom(self, node: ast.ImportFrom) -> None:
+            for alias in node.names:
                 if alias.name != "*":
                     bound.add(alias.asname or alias.name)
 
-        def _nested(self, n: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> None:
-            for arg in _all_args(n.args):
+        def _nested(self, node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda) -> None:
+            for arg in _all_args(node.args):
                 bound.add(arg.arg)
-            loaded.update(_free_names(n) - bound)
+            loaded.update(_free_names(node) - bound)
 
     body = node.body if not isinstance(node, ast.Lambda) else [node.body]
     if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):

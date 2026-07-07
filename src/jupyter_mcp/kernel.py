@@ -8,13 +8,15 @@ whole-notebook re-runs.
 
 from __future__ import annotations
 
+import contextlib
 import queue
 import subprocess
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from jupyter_client.kernelspec import KernelSpec, KernelSpecManager, NoSuchKernel
+from jupyter_client.blocking.client import BlockingKernelClient
+from jupyter_client.kernelspec import KernelSpec, KernelSpecManager
 from jupyter_client.manager import KernelManager
 from nbformat.v4 import output_from_msg
 
@@ -115,7 +117,7 @@ class KernelSession:
         #: persisted staleness metadata can't outlive the state it describes
         self.epoch: str | None = None
         self._km: KernelManager | None = None
-        self._kc = None
+        self._kc: BlockingKernelClient | None = None
 
     @property
     def alive(self) -> bool:
@@ -135,16 +137,20 @@ class KernelSession:
         if km is None:
             self.kernel_name, self.note = resolve_kernel_name(self.requested_kernel)
             km = KernelManager(kernel_name=self.kernel_name)
+        # wrap ALL startup failures (missing spec, socket permissions, dead
+        # process, ...) as KernelError so tool callers get an actionable
+        # message instead of a raw traceback
         try:
             km.start_kernel(cwd=str(self.notebook_path.parent))
-        except NoSuchKernel as e:
+        except Exception as e:
             raise KernelError(f"Cannot start kernel {self.kernel_name!r}: {e}") from e
-        kc = km.client()
-        kc.start_channels()
         try:
+            kc = km.client()
+            kc.start_channels()
             kc.wait_for_ready(timeout=STARTUP_TIMEOUT)
-        except RuntimeError as e:
-            km.shutdown_kernel(now=True)
+        except Exception as e:
+            with contextlib.suppress(Exception):
+                km.shutdown_kernel(now=True)
             raise KernelError(f"Kernel {self.kernel_name!r} did not become ready: {e}") from e
         self._km, self._kc = km, kc
         self.epoch = uuid.uuid4().hex[:12]
@@ -155,9 +161,13 @@ class KernelSession:
             self.start()
 
     def restart(self) -> None:
-        if self._km is not None and self._km.is_alive():
-            self._km.restart_kernel(now=True)
-            self._kc.wait_for_ready(timeout=STARTUP_TIMEOUT)
+        if self._km is not None and self._kc is not None and self._km.is_alive():
+            try:
+                self._km.restart_kernel(now=True)
+                self._kc.wait_for_ready(timeout=STARTUP_TIMEOUT)
+            except Exception as e:
+                self.shutdown()
+                raise KernelError(f"Kernel restart failed: {e}") from e
             self.epoch = uuid.uuid4().hex[:12]
         else:
             self.ensure_started()
@@ -186,6 +196,8 @@ class KernelSession:
         """Run code, collecting outputs as nbformat output dicts."""
         self.ensure_started()
         kc = self._kc
+        if kc is None:  # unreachable after ensure_started; narrows the type
+            raise KernelError("Kernel client unavailable.")
         msg_id = kc.execute(code, store_history=True, allow_stdin=False, stop_on_error=False)
 
         outputs: list[dict] = []

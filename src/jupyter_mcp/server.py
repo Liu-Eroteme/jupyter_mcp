@@ -22,7 +22,7 @@ from .errors import JupyterMcpError
 from .kernel import inspect_code
 from .model import CellRef, cell_meta
 from .session import NotebookSession, Registry
-from .summaries import get_summary, get_tldr
+from .summaries import get_summary, get_tldr, output_hash
 
 mcp = FastMCP("jupyter-eda")
 registry = Registry()
@@ -362,6 +362,8 @@ def inspect_variable(path: str, variable: str, timeout_seconds: float = 30) -> s
 def undo_last(path: str) -> str:
     """Restore the notebook to its state before the most recent mutation."""
     session = registry.get(path)
+    # an undo overwrites the file — external edits void it like any mutation
+    session.guard_mutation()
     op = session.nbfile.undo_last()
     return f"Undid {op!r}. Re-read cells before further edits (revisions changed)."
 
@@ -398,8 +400,11 @@ def summarize_cells(path: str, names: list[str] | None = None, include_outputs: 
         else:
             lines.append(f"  {get_tldr(ref.cell)}")
         out_summ = cell_meta(ref.cell).get("output_summary")
-        if include_outputs and out_summ:
-            lines.append(f"  output: {out_summ['text']}")
+        if include_outputs and out_summ and ref.cell.get("outputs"):
+            # only show a summary that describes the CURRENT outputs
+            current = condense_outputs(ref.cell.outputs).text
+            if out_summ.get("output_hash") == output_hash(current):
+                lines.append(f"  output: {out_summ['text']}")
     if notices:
         lines.append("")
         lines.extend(f"note: {n}" for n in dict.fromkeys(notices))

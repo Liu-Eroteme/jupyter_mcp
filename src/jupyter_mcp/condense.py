@@ -20,6 +20,7 @@ import csv
 import io
 import json
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from html.parser import HTMLParser
 
@@ -184,7 +185,7 @@ def _mime_bundle_text(data: dict, images: list[bytes]) -> str | None:
     return f"[unrendered output: {keys}]" if keys else None
 
 
-def condense_outputs(outputs: list[dict], max_chars: int = MAX_OUTPUT_CHARS) -> Condensed:
+def condense_outputs(outputs: Sequence[dict], max_chars: int = MAX_OUTPUT_CHARS) -> Condensed:
     """Convert a cell's nbformat outputs into one condensed text block + images."""
     parts: list[str] = []
     images: list[bytes] = []

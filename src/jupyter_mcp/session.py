@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import atexit
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TypeVar, cast
+
+from nbformat import NotebookNode
 
 from .condense import Condensed, condense_outputs
 from .dag import NotebookGraph, build_graph
@@ -12,6 +14,8 @@ from .errors import ExternalModification, JupyterMcpError
 from .kernel import DEFAULT_EXEC_TIMEOUT, KernelSession
 from .model import META_NS, NotebookFile, cell_meta
 from .summaries import Summarizer
+
+T = TypeVar("T")
 
 
 class NotebookSession:
@@ -38,10 +42,17 @@ class NotebookSession:
             self.nbfile.load()
             raise ExternalModification(str(self.path))
 
-    def mutate(self, op: str, fn: Callable[[], object]) -> object:
+    def mutate(self, op: str, fn: Callable[[], T]) -> T:
         self.guard_mutation()
         self.nbfile.snapshot(op)
-        result = fn()
+        try:
+            result = fn()
+        except Exception:
+            # disk still holds the last saved state (save only runs on
+            # success) — reload so a partially-applied mutation can't linger
+            # in memory and get persisted by the next operation
+            self.nbfile.load()
+            raise
         self.nbfile.save()
         return result
 
@@ -121,6 +132,13 @@ class NotebookSession:
                 results.append((name, "skipped", Condensed(text="(skipped: earlier cell failed)")))
                 continue
             ref = self.nbfile.get(name)
+            meta = cell_meta(ref.cell)
+            # any execution attempt voids the old stamp: a failed or
+            # interrupted run can still mutate kernel state, so freshness
+            # must be re-earned by a successful run
+            meta.pop("last_exec_rev", None)
+            meta.pop("last_exec_epoch", None)
+            meta.pop("output_summary", None)  # outputs are being replaced
             res = kernel.execute(ref.cell.source, timeout=timeout)
             ref.cell.outputs = [_as_output_node(o) for o in res.outputs]
             ref.cell.execution_count = res.execution_count
@@ -128,8 +146,8 @@ class NotebookSession:
             if res.note:
                 condensed.text = f"[{res.note}]\n{condensed.text}"
             if res.status == "ok":
-                cell_meta(ref.cell)["last_exec_rev"] = ref.rev
-                cell_meta(ref.cell)["last_exec_epoch"] = kernel.epoch
+                meta["last_exec_rev"] = ref.rev
+                meta["last_exec_epoch"] = kernel.epoch
             else:
                 failed = True
             results.append((name, res.status, condensed))
@@ -137,10 +155,11 @@ class NotebookSession:
         return results
 
 
-def _as_output_node(out: dict):
+def _as_output_node(out: dict) -> NotebookNode:
     from nbformat import from_dict
 
-    return from_dict(out)
+    # from_dict is typed for arbitrary nesting; a dict input yields a node
+    return cast(NotebookNode, from_dict(out))
 
 
 class Registry:
