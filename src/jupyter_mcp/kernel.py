@@ -9,8 +9,12 @@ whole-notebook re-runs.
 from __future__ import annotations
 
 import contextlib
+import os
 import queue
+import shutil
 import subprocess
+import tempfile
+import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -24,8 +28,16 @@ from .errors import KernelError
 
 STARTUP_TIMEOUT = 60.0
 DEFAULT_EXEC_TIMEOUT = 120.0
+#: idle kernels are shut down after this many seconds (lazily, on registry
+#: access); the next execution restarts them with a fresh epoch → all stale
+KERNEL_IDLE_TTL = float(os.environ.get("JUPYTER_MCP_KERNEL_TTL_SECONDS", "1800"))
 _VENV_KERNEL = "__jupyter_mcp_project_venv__"
 _MAX_VENV_WALK = 8
+
+
+def _transport() -> str:
+    # unix sockets: no open TCP ports, and no ipykernel plaintext warning
+    return "ipc" if os.name == "posix" else "tcp"
 
 
 @dataclass
@@ -89,7 +101,9 @@ def _venv_kernel_manager(python: Path) -> KernelManager:
         language="python",
     )
     return KernelManager(
-        kernel_name=_VENV_KERNEL, kernel_spec_manager=_StaticSpecManager(spec)
+        kernel_name=_VENV_KERNEL,
+        kernel_spec_manager=_StaticSpecManager(spec),
+        transport=_transport(),
     )
 
 
@@ -116,8 +130,10 @@ class KernelSession:
         #: identifies one live kernel's state; changes on every (re)start so
         #: persisted staleness metadata can't outlive the state it describes
         self.epoch: str | None = None
+        self.last_used = time.monotonic()
         self._km: KernelManager | None = None
         self._kc: BlockingKernelClient | None = None
+        self._ipc_dir: str | None = None
 
     @property
     def alive(self) -> bool:
@@ -136,7 +152,13 @@ class KernelSession:
                 self.note = f"using project venv interpreter: {python}"
         if km is None:
             self.kernel_name, self.note = resolve_kernel_name(self.requested_kernel)
-            km = KernelManager(kernel_name=self.kernel_name)
+            km = KernelManager(kernel_name=self.kernel_name, transport=_transport())
+        if km.transport == "ipc":
+            # ipc socket paths resolve relative to each process's cwd, and the
+            # kernel runs in the notebook dir — they MUST be absolute (and
+            # short: sun_path caps at ~107 chars, so no deep runtime dirs)
+            self._ipc_dir = tempfile.mkdtemp(prefix="jupyter-mcp-ipc-")
+            km.ip = f"{self._ipc_dir}/k"
         # wrap ALL startup failures (missing spec, socket permissions, dead
         # process, ...) as KernelError so tool callers get an actionable
         # message instead of a raw traceback
@@ -154,6 +176,7 @@ class KernelSession:
             raise KernelError(f"Kernel {self.kernel_name!r} did not become ready: {e}") from e
         self._km, self._kc = km, kc
         self.epoch = uuid.uuid4().hex[:12]
+        self.last_used = time.monotonic()
 
     def ensure_started(self) -> None:
         if not self.alive:
@@ -185,6 +208,9 @@ class KernelSession:
             except Exception:
                 pass
             self._km = None
+        if self._ipc_dir is not None:
+            shutil.rmtree(self._ipc_dir, ignore_errors=True)
+            self._ipc_dir = None
 
     def interrupt(self) -> None:
         if self._km is not None and self._km.is_alive():
@@ -195,6 +221,7 @@ class KernelSession:
     def execute(self, code: str, timeout: float = DEFAULT_EXEC_TIMEOUT) -> ExecResult:
         """Run code, collecting outputs as nbformat output dicts."""
         self.ensure_started()
+        self.last_used = time.monotonic()
         kc = self._kc
         if kc is None:  # unreachable after ensure_started; narrows the type
             raise KernelError("Kernel client unavailable.")

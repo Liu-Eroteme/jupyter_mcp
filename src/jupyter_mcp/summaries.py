@@ -127,7 +127,14 @@ class Summarizer:
         for ref in nbfile.refs():
             if names is not None and ref.name not in names:
                 continue
-            if get_summary(ref.cell) is None and ref.cell.source.strip():
+            if not ref.cell.source.strip():
+                continue
+            summ = get_summary(ref.cell)
+            if summ is None:
+                out.append(ref.name)
+            elif summ.get("source") == "fallback" and self._disabled_reason is None:
+                # a degraded summary (credit outage, network blip) is retried
+                # once the LLM is available again — never permanent
                 out.append(ref.name)
         return out
 

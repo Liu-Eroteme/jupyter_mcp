@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import time
 from pathlib import Path
 from typing import Callable, TypeVar, cast
 
@@ -11,7 +12,7 @@ from nbformat import NotebookNode
 from .condense import Condensed, condense_outputs
 from .dag import NotebookGraph, build_graph
 from .errors import ExternalModification, JupyterMcpError
-from .kernel import DEFAULT_EXEC_TIMEOUT, KernelSession
+from .kernel import DEFAULT_EXEC_TIMEOUT, KERNEL_IDLE_TTL, KernelSession
 from .model import META_NS, NotebookFile, cell_meta
 from .summaries import Summarizer
 
@@ -102,6 +103,23 @@ class NotebookSession:
             self._kernel.shutdown()
             self._kernel = None
 
+    def kernel_status(self) -> str:
+        k = self._kernel
+        if k is None or k.epoch is None:
+            return "not started (launches on first execution)"
+        if not k.alive:
+            return "dead (restarts on next execution)"
+        desc = k.note or f"kernelspec {k.kernel_name!r}"
+        return f"alive — {desc} (epoch {k.epoch})"
+
+    def expire_idle_kernel(self, ttl: float) -> bool:
+        """Shut the kernel down if it has been idle longer than `ttl`."""
+        k = self._kernel
+        if k is not None and k.alive and time.monotonic() - k.last_used > ttl:
+            self.shutdown_kernel()
+            return True
+        return False
+
     def execute_cells(
         self, names: list[str], timeout: float = DEFAULT_EXEC_TIMEOUT
     ) -> list[tuple[str, str, Condensed]]:
@@ -172,8 +190,17 @@ class Registry:
         p = Path(path).expanduser().resolve()
         if p.suffix != ".ipynb":
             raise JupyterMcpError(f"{p} is not a .ipynb file.")
-        if p in self._sessions:
-            return self._sessions[p]
+        for other in list(self._sessions.values()):
+            other.expire_idle_kernel(KERNEL_IDLE_TTL)
+        session = self._sessions.get(p)
+        if session is not None:
+            if not p.exists():
+                self.evict(p)
+                raise JupyterMcpError(
+                    f"{p} was deleted or moved on disk; its session and kernel were "
+                    "shut down. Check the path, or recreate it with create_notebook."
+                )
+            return session
         if not p.exists():
             raise JupyterMcpError(
                 f"{p} does not exist. Use create_notebook to start a new one."
@@ -181,6 +208,14 @@ class Registry:
         session = NotebookSession(p, self.summarizer)
         self._sessions[p] = session
         return session
+
+    def evict(self, p: Path) -> None:
+        session = self._sessions.pop(p, None)
+        if session is not None:
+            try:
+                session.shutdown_kernel()
+            except Exception:
+                pass
 
     def register_new(self, path: str, kernel_name: str = "python3") -> NotebookSession:
         p = Path(path).expanduser().resolve()

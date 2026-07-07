@@ -105,7 +105,9 @@ class NotebookFile:
         self.path = path.resolve()
         self.nb: NotebookNode = None  # type: ignore[assignment]
         self._disk_sha: str | None = None
-        self._undo_stack: list[Path] = []
+        # seed from disk so snapshots from a previous server process remain
+        # undoable (filenames sort chronologically)
+        self._undo_stack: list[Path] = sorted(self._snapshot_dir().glob("*.ipynb"))
         self._names_dirty = False
 
     # ------------------------------------------------------------- loading

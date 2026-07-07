@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import functools
 import re
+import sys
+import traceback
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
@@ -35,6 +37,9 @@ def _tool_errors(fn):
             return fn(*args, **kwargs)
         except JupyterMcpError as e:
             return f"ERROR: {e}"
+        except Exception as e:  # last resort — never leak a raw traceback to the wire
+            traceback.print_exc(file=sys.stderr)
+            return f"ERROR (internal {type(e).__name__}): {e} — traceback logged to server stderr."
 
     return wrapper
 
@@ -156,7 +161,10 @@ def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
             session.nbfile.save()
         notice = result.notice
     stale = set(session.stale_names(graph))
-    lines = [f"# {session.path} — {len(session.nbfile.cells)} cells"]
+    lines = [
+        f"# {session.path} — {len(session.nbfile.cells)} cells",
+        f"kernel: {session.kernel_status()}",
+    ]
     for ref in session.nbfile.refs():
         marker = " STALE" if ref.name in stale else ""
         lines.append(
@@ -213,6 +221,23 @@ def read_cells(
     return blocks
 
 
+def _after_mutation(session: NotebookSession, header: str, focus: str, run: str):
+    """Shared tail for add/update: either report, or fold in a stale run."""
+    if run not in ("none", "stale"):
+        raise JupyterMcpError('run must be "none" or "stale"')
+    if run == "stale":
+        stale = session.stale_names()
+        if not stale:
+            return f"{header}\nNothing is stale — no cells executed."
+        blocks = _render_exec_results(session, session.execute_cells(stale))
+        if blocks and isinstance(blocks[0], str):
+            blocks[0] = f"{header}\n\n{blocks[0]}"
+        else:
+            blocks.insert(0, header)
+        return blocks
+    return f"{header}\n" + _mutation_footer(session, focus)
+
+
 @mcp.tool()
 @_tool_errors
 def add_cell(
@@ -222,18 +247,19 @@ def add_cell(
     cell_type: str = "code",
     after: str | None = None,
     index: int | None = None,
-) -> str:
+    run: str = "none",
+):
     """Add a cell. `name` must be unique kebab-case. Placement: `after` (an
-    existing cell name; '' prepends), `index`, or omit both to append."""
+    existing cell name; '' prepends), `index`, or omit both to append.
+    `run="stale"` immediately executes every stale cell (the add→run loop in
+    one call) and returns the execution results."""
     session = registry.get(path)
     ref: CellRef = session.mutate(
         f"add-{name}",
         lambda: session.nbfile.add_cell(name, source, cell_type, after, index),
     )
-    return (
-        f"Added {ref.cell.cell_type} cell {ref.name!r} at index {ref.index} (rev {ref.rev}).\n"
-        + _mutation_footer(session, ref.name)
-    )
+    header = f"Added {ref.cell.cell_type} cell {ref.name!r} at index {ref.index} (rev {ref.rev})."
+    return _after_mutation(session, header, ref.name, run)
 
 
 @mcp.tool()
@@ -244,18 +270,20 @@ def update_cell(
     expected_rev: str,
     source: str | None = None,
     new_name: str | None = None,
-) -> str:
+    run: str = "none",
+):
     """Replace a cell's source and/or rename it. `expected_rev` must be the
     rev from your latest read of this cell (optimistic locking). Updating
-    source clears the cell's outputs and marks it (and dependents) stale."""
+    source clears the cell's outputs and marks it (and dependents) stale.
+    `run="stale"` immediately executes every stale cell (the edit→run loop in
+    one call) and returns the execution results."""
     session = registry.get(path)
     ref: CellRef = session.mutate(
         f"update-{name}",
         lambda: session.nbfile.update_cell(name, expected_rev, source, new_name),
     )
-    return (
-        f"Updated cell {ref.name!r} (new rev {ref.rev}).\n" + _mutation_footer(session, ref.name)
-    )
+    header = f"Updated cell {ref.name!r} (new rev {ref.rev})."
+    return _after_mutation(session, header, ref.name, run)
 
 
 @mcp.tool()
@@ -286,32 +314,39 @@ def move_cell(
 
 @mcp.tool()
 @_tool_errors
-def execute_cells(path: str, names: list[str], timeout_seconds: float = 120) -> list:
+def execute_cells(
+    path: str, names: list[str], timeout_seconds: float = 120, quiet: bool = False
+) -> list:
     """Execute the named code cells (in document order) on the notebook's
     persistent kernel. Outputs are written to the file and returned condensed;
-    charts come back as images. Execution stops at the first failing cell."""
+    charts come back as images. Execution stops at the first failing cell.
+    `quiet` collapses successful cells to one status line each (errors and
+    images always come through in full)."""
     session = registry.get(path)
     results = session.execute_cells(names, timeout=timeout_seconds)
-    return _render_exec_results(session, results)
+    return _render_exec_results(session, results, quiet=quiet)
 
 
 @mcp.tool()
 @_tool_errors
-def run_stale(path: str, timeout_seconds: float = 120) -> list:
+def run_stale(path: str, timeout_seconds: float = 120, quiet: bool = False) -> list:
     """Execute every stale cell (changed since last run, plus dependents) in
     document order. The minimal-recompute alternative to re-running the whole
-    notebook."""
+    notebook. `quiet` collapses successful cells to one status line each
+    (errors and images always come through in full)."""
     session = registry.get(path)
     session.refresh_reads()
     stale = session.stale_names()
     if not stale:
         return ["Nothing is stale — all code cells are up to date."]
     results = session.execute_cells(stale, timeout=timeout_seconds)
-    return _render_exec_results(session, results)
+    return _render_exec_results(session, results, quiet=quiet)
 
 
 def _render_exec_results(
-    session: NotebookSession, results: list[tuple[str, str, Condensed]]
+    session: NotebookSession,
+    results: list[tuple[str, str, Condensed]],
+    quiet: bool = False,
 ) -> list:
     blocks: list = []
     text_parts: list[str] = []
@@ -321,7 +356,10 @@ def _render_exec_results(
             rev = f" rev {session.nbfile.get(name).rev};"
         except JupyterMcpError:
             pass
-        text_parts.append(f"## {name} — {status}{rev}\n{condensed.text}")
+        if quiet and status == "ok":
+            text_parts.append(f"## {name} — ok{rev}")
+        else:
+            text_parts.append(f"## {name} — {status}{rev}\n{condensed.text}")
         for png in condensed.images:
             blocks.append("\n\n".join(text_parts))
             text_parts = []
@@ -414,8 +452,8 @@ def summarize_cells(path: str, names: list[str] | None = None, include_outputs: 
 @mcp.tool()
 @_tool_errors
 def search_cells(path: str, query: str, regex: bool = False) -> str:
-    """Search cell sources, names, and summaries. Returns matching cells with
-    the matching lines."""
+    """Search cell sources, names, summaries, and condensed outputs. Returns
+    matching cells with the matching lines."""
     session = registry.get(path)
     session.refresh_reads()
     try:
@@ -433,6 +471,13 @@ def search_cells(path: str, query: str, regex: bool = False) -> str:
         for i, line in enumerate(ref.cell.source.splitlines(), 1):
             if pattern.search(line):
                 matches.append(f"  L{i}: {line.strip()[:120]}")
+        if ref.cell.cell_type == "code" and ref.cell.get("outputs"):
+            out_matches = [
+                f"  out: {line.strip()[:120]}"
+                for line in condense_outputs(ref.cell.outputs).text.splitlines()
+                if pattern.search(line)
+            ]
+            matches.extend(out_matches[:5])  # cap noise from repetitive outputs
         if matches:
             hits.append(f"[{ref.index}] {ref.name} (rev {ref.rev})\n" + "\n".join(matches))
     return "\n\n".join(hits) if hits else f"No matches for {query!r}."

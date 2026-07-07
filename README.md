@@ -34,9 +34,9 @@ This server fixes each of those with an opinionated data model.
 | `create_notebook` | New empty notebook |
 | `notebook_overview` | Index: names, revs, staleness, tldrs, edges, lint |
 | `read_cells` | Full cells (code + condensed outputs + images), by names/slice |
-| `add_cell` / `update_cell` / `remove_cell` / `move_cell` | Mutations; all take `expected_rev` |
-| `execute_cells` | Run named cells on the persistent kernel |
-| `run_stale` | Minimal re-execution after edits |
+| `add_cell` / `update_cell` / `remove_cell` / `move_cell` | Mutations; all take `expected_rev`; add/update accept `run="stale"` to fold the edit→run loop into one call |
+| `execute_cells` | Run named cells on the persistent kernel (`quiet` collapses ok cells to status lines) |
+| `run_stale` | Minimal re-execution after edits (`quiet` supported) |
 | `restart_kernel` | Fresh kernel; marks everything stale |
 | `inspect_variable` | Type/shape/schema/head of a live variable, no cell needed |
 | `undo_last` | Restore pre-mutation snapshot |
@@ -65,7 +65,10 @@ Register with Claude Code (`.mcp.json` in any project, or globally):
 The server is multi-notebook: every tool takes a notebook `path`, one kernel
 per notebook, started lazily in the notebook's directory (so relative data
 paths behave like in your editor). Kernelspec comes from the notebook's
-metadata, falling back to `python3`.
+metadata, falling back to `python3`. Kernels idle longer than 30 minutes are
+shut down lazily (`JUPYTER_MCP_KERNEL_TTL_SECONDS` overrides); the next
+execution restarts them, and epoch-scoped staleness handles the rest. On
+POSIX, kernels connect over IPC sockets (no open TCP ports).
 
 ### Summaries & credentials
 
@@ -91,8 +94,6 @@ below the server is unit-testable without MCP.
   attribute mutation through aliases) are invisible. Method calls only count
   as mutations for a known allowlist (`append`, `fit`, ...) — pure-functional
   chains (polars) intentionally create no false forward edges.
-- The undo stack is per-server-process (snapshots persist on disk, but a
-  restarted server won't offer them for undo).
 - `%%bash` / `%%sql` style cells are treated as opaque (no dependencies).
 - Concurrent edits from a live Jupyter editor are detected (the server
   reloads and rejects the mutation) but not merged.

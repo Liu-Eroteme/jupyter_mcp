@@ -294,3 +294,111 @@ def test_edit_revert_without_run_stays_fresh(nb):
     assert session.stale_names() == ["a"]
     server.update_cell(str(nb), "a", _rev(nb, "a"), source="x = 1")
     assert session.stale_names() == []
+
+
+# ------------------------------------------------------------ round 3: P1-P3
+
+
+def test_deleted_notebook_clean_error(nb):
+    server.add_cell(str(nb), "a", "x = 1")
+    nb.unlink()
+    res = server.notebook_overview(str(nb))
+    assert isinstance(res, str) and res.startswith("ERROR") and "deleted or moved" in res
+    # the session was evicted: a second call reports a plain missing file
+    res = server.notebook_overview(str(nb))
+    assert res.startswith("ERROR") and "does not exist" in res
+
+
+def test_internal_errors_never_leak_raw(nb, monkeypatch):
+    monkeypatch.setattr(
+        server.registry, "get", lambda path: (_ for _ in ()).throw(RuntimeError("boom"))
+    )
+    res = server.notebook_overview(str(nb))
+    assert isinstance(res, str)
+    assert res.startswith("ERROR (internal RuntimeError)") and "boom" in res
+
+
+def test_overview_shows_kernel_status(nb):
+    server.add_cell(str(nb), "a", "x = 1")
+    overview = server.notebook_overview(str(nb))
+    assert "kernel: not started" in overview
+
+
+def test_run_param_validated(nb):
+    res = server.add_cell(str(nb), "a", "x = 1", run="bogus")
+    assert res.startswith("ERROR") and "run must be" in res
+
+
+def test_undo_survives_new_session(nb):
+    """The undo stack is seeded from on-disk snapshots, so undo works after
+    a server restart."""
+    server.add_cell(str(nb), "keep", "x = 1")
+    server.add_cell(str(nb), "oops", "y = 2")
+
+    fresh = NotebookFile(nb)  # simulates a new server process
+    fresh.load()
+    op = fresh.undo_last()
+    assert op == "add-oops"
+    assert _disk_names(nb) == ["keep"]
+
+
+def test_search_finds_output_lines(nb):
+    import nbformat
+
+    server.add_cell(str(nb), "calc", "print(compute())")
+    session = server.registry.get(str(nb))
+    ref = session.nbfile.get("calc")
+    ref.cell.outputs = [
+        nbformat.v4.new_output("stream", name="stdout", text="ratio: 3.532\n")
+    ]
+    session.nbfile.save()
+    hits = server.search_cells(str(nb), "3.532")
+    assert "calc" in hits and "out: ratio: 3.532" in hits
+
+
+@pytest.mark.kernel
+def test_update_cell_run_stale(nb):
+    server.add_cell(str(nb), "load", "data = [1, 2, 3]")
+    server.add_cell(str(nb), "use", "print('sum', sum(data))")
+    server.run_stale(str(nb))
+
+    res = server.update_cell(
+        str(nb), "load", _rev(nb, "load"), source="data = [10, 20]", run="stale"
+    )
+    assert isinstance(res, list)
+    text = "\n".join(b for b in res if isinstance(b, str))
+    assert "Updated cell 'load'" in text
+    assert "## load — ok" in text and "sum 30" in text
+    assert "all cells up to date" in text
+
+    # nothing stale afterwards: run="stale" reports instead of executing
+    res = server.update_cell(str(nb), "use", _rev(nb, "use"), new_name="report", run="stale")
+    assert isinstance(res, str) and "Nothing is stale" in res
+
+
+@pytest.mark.kernel
+def test_quiet_execution(nb):
+    server.add_cell(str(nb), "load", "data = [1, 2, 3]")
+    server.add_cell(str(nb), "use", "print('sum', sum(data))")
+    server.add_cell(str(nb), "broken", "boom()")
+    blocks = server.run_stale(str(nb), quiet=True)
+    text = "\n".join(b for b in blocks if isinstance(b, str))
+    assert "## load — ok" in text and "## use — ok" in text
+    assert "sum 6" not in text  # ok output collapsed
+    assert "NameError" in text  # errors still come through in full
+
+
+@pytest.mark.kernel
+def test_idle_kernel_ttl(nb):
+    server.add_cell(str(nb), "a", "x = 1")
+    server.execute_cells(str(nb), names=["a"])
+    session = server.registry.get(str(nb))
+    assert session.stale_names() == []
+
+    kernel = session._kernel
+    assert kernel is not None
+    kernel.last_used -= 10 * 24 * 3600  # simulate long idleness
+    overview = server.notebook_overview(str(nb))  # registry access sweeps
+    assert session._kernel is None
+    assert "kernel: not started" in overview
+    assert "STALE" in overview  # a future kernel has a new epoch
