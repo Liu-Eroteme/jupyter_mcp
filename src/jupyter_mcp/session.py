@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import atexit
+import hashlib
 import threading
 import time
 from pathlib import Path
@@ -21,6 +22,24 @@ from .tasks import Batch, ExecTask, Executor
 T = TypeVar("T")
 
 
+def _dep_signature(name: str, graph: NotebookGraph, ids: dict[str, str]) -> str:
+    """Rename-stable fingerprint of a cell's data dependencies.
+
+    Records WHO provides each variable (by stable nbformat cell id), so edge
+    removals, definer deletions, and reorderings all change it while a mere
+    rename does not. Freshness requires the fingerprint stamped at execution
+    time to still match — rev+epoch alone miss structural changes where no
+    source in the closure changed (e.g. deleting one of two definers).
+    """
+    parents = graph.parents.get(name, {})
+    parts = sorted(
+        f"{var}<{ids.get(parent, parent)}"
+        for parent, variables in parents.items()
+        for var in variables
+    )
+    return hashlib.sha256("|".join(parts).encode()).hexdigest()[:10]
+
+
 class NotebookSession:
     def __init__(self, path: Path, summarizer: Summarizer):
         self.path = path.resolve()
@@ -29,6 +48,7 @@ class NotebookSession:
         self.nbfile.load()
         self._kernel: KernelSession | None = None
         self._executor: Executor | None = None
+        self._stopping = False
         #: guards nbfile state; the executor thread and tool threads both
         #: read and write it (RLock: mutate() nests guard_mutation())
         self._lock = threading.RLock()
@@ -50,6 +70,20 @@ class NotebookSession:
             if self.nbfile.disk_changed():
                 self.nbfile.load()
                 raise ExternalModification(str(self.path))
+
+    def save_if_unchanged(self) -> bool:
+        """Persist in-memory state unless the file changed on disk meanwhile.
+
+        For metadata-only writers (summaries): an external edit during a slow
+        LLM call must win — returns False after reloading, and the discarded
+        summaries simply regenerate on the next call (hash-keyed).
+        """
+        with self._lock:
+            if self.nbfile.disk_changed():
+                self.nbfile.load()
+                return False
+            self.nbfile.save()
+            return True
 
     def mutate(self, op: str, fn: Callable[[], T]) -> T:
         with self._lock:
@@ -85,6 +119,7 @@ class NotebookSession:
         """
         with self._lock:
             graph = graph or self.graph()
+            ids = {r.name: str(r.cell.get("id", r.name)) for r in self.nbfile.refs()}
             epoch = (
                 self._kernel.epoch if self._kernel is not None and self._kernel.alive else None
             )
@@ -93,7 +128,12 @@ class NotebookSession:
                 if ref.cell.cell_type != "code" or not ref.cell.source.strip():
                     continue
                 meta = cell_meta(ref.cell)
-                if meta.get("last_exec_rev") != ref.rev or meta.get("last_exec_epoch") != epoch or epoch is None:
+                if (
+                    epoch is None
+                    or meta.get("last_exec_rev") != ref.rev
+                    or meta.get("last_exec_epoch") != epoch
+                    or meta.get("last_exec_deps") != _dep_signature(ref.name, graph, ids)
+                ):
                     changed.add(ref.name)
             stale = graph.stale_closure(changed)
             code_names = {
@@ -230,6 +270,9 @@ class NotebookSession:
 
     def _run_task(self, task: ExecTask) -> None:
         """Executor-thread callback: run one task against the kernel."""
+        if self._stopping:
+            task.status, task.note = "cancelled", "session shut down"
+            return
         if task.adhoc:
             kernel = self.kernel()
             kernel.ensure_started()
@@ -261,14 +304,33 @@ class NotebookSession:
         task.status, task.note = res.status, res.note
         task.execution_count = res.execution_count
         with self._lock:
+            if self._stopping:
+                # a stopped session must not touch the file (it may have been
+                # deleted — a save would resurrect it)
+                task.batch.failed = task.status != "ok"
+                return
+            if self.nbfile.disk_changed():
+                # a live editor saved during the run — its edits win; merge
+                # our result into the reloaded state instead of clobbering
+                self.nbfile.load()
+                extra = "notebook changed on disk during the run; reloaded before persisting"
+                task.note = f"{task.note}; {extra}" if task.note else extra
             ref = self._find(task.name)
             if ref is not None and ref.rev == task.rev:
                 ref.cell.outputs = [_as_output_node(o) for o in task.buffer.snapshot()]
                 ref.cell.execution_count = res.execution_count
+                meta = cell_meta(ref.cell)
+                # a reload may have brought back a pre-run stamp — the
+                # attempt must void it either way
+                meta.pop("last_exec_rev", None)
+                meta.pop("last_exec_epoch", None)
+                meta.pop("output_summary", None)
                 if res.status == "ok":
-                    meta = cell_meta(ref.cell)
+                    graph = self.graph()
+                    ids = {r.name: str(r.cell.get("id", r.name)) for r in self.nbfile.refs()}
                     meta["last_exec_rev"] = task.rev
                     meta["last_exec_epoch"] = kernel.epoch
+                    meta["last_exec_deps"] = _dep_signature(task.name, graph, ids)
             elif ref is not None:
                 extra = "cell changed during the run; outputs not persisted"
                 task.note = f"{task.note}; {extra}" if task.note else extra
@@ -283,9 +345,15 @@ class NotebookSession:
         return None
 
     def stop(self) -> None:
+        self._stopping = True
         if self._executor is not None:
             self._executor.stop()
             self._executor = None
+        if self._kernel is not None:
+            try:
+                self._kernel.interrupt()  # unblock a running cell promptly
+            except Exception:
+                pass
         self.shutdown_kernel()
 
 

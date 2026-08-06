@@ -162,9 +162,10 @@ def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
     notice = ""
     if refresh_summaries:
         result = session.summarizer.refresh(session.nbfile, graph)
-        if result.refreshed:
-            session.nbfile.save()
         notice = result.notice
+        if result.refreshed and not session.save_if_unchanged():
+            extra = "file changed on disk during summarization — reloaded; summaries regenerate next call"
+            notice = f"{notice}; {extra}" if notice else extra
     stale = set(session.stale_names(graph))
     current, queued_names = session.activity()
     queued = set(queued_names)
@@ -510,7 +511,10 @@ def summarize_cells(path: str, names: list[str] | None = None, include_outputs: 
         out_result = session.summarizer.summarize_outputs(session.nbfile, items)
         if out_result.notice:
             notices.append(out_result.notice)
-    session.nbfile.save()
+    if not session.save_if_unchanged():
+        notices.append(
+            "file changed on disk during summarization — reloaded; summaries regenerate next call"
+        )
 
     lines = []
     for ref in _select_refs(session, names, None):

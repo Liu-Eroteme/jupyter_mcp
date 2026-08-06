@@ -513,3 +513,129 @@ def test_inspect_rich_reprs(nb):
     from mcp.server.fastmcp import Image
 
     assert any(isinstance(b, Image) for b in out)
+
+
+# ------------------------------------------- round 5: codex review findings
+
+
+@pytest.mark.kernel
+def test_edge_removal_marks_former_dependent_stale(nb):
+    """Regression: editing a definer so the dependency edge disappears left
+    the former dependent reading fresh with orphaned outputs."""
+    server.add_cell(str(nb), "load", "x = 1")
+    server.add_cell(str(nb), "use", "print('x is', x)")
+    server.run(str(nb))
+    session = server.registry.get(str(nb))
+    assert session.stale_names() == []
+
+    server.update_cell(str(nb), "load", _rev(nb, "load"), source="z = 1")
+    assert "use" in session.stale_names()
+
+
+@pytest.mark.kernel
+def test_definer_removal_marks_user_stale(nb):
+    """Regression: deleting one of two definers changes no cell's rev, so
+    nothing read stale — despite the user's provider having changed."""
+    server.add_cell(str(nb), "load1", "y = 1")
+    server.add_cell(str(nb), "load2", "y = 2")
+    server.add_cell(str(nb), "usey", "print('y is', y)")
+    server.run(str(nb))
+    session = server.registry.get(str(nb))
+    server.remove_cell(str(nb), "load2", _rev(nb, "load2"))
+    assert "usey" in session.stale_names()
+
+
+@pytest.mark.kernel
+def test_move_changing_provider_marks_user_stale(nb):
+    server.add_cell(str(nb), "load1", "y = 1")
+    server.add_cell(str(nb), "load2", "y = 2")
+    server.add_cell(str(nb), "usey", "print('y is', y)")
+    server.run(str(nb))
+    session = server.registry.get(str(nb))
+    # moving load2 to the top makes load1 the last writer before usey
+    server.move_cell(str(nb), "load2", _rev(nb, "load2"), after="")
+    assert "usey" in session.stale_names()
+
+
+@pytest.mark.kernel
+def test_rename_does_not_invalidate_dependents(nb):
+    """Dependency signatures are keyed by stable cell id, not name — a
+    rename must not force dependents to re-run."""
+    server.add_cell(str(nb), "load", "x = 1")
+    server.add_cell(str(nb), "use", "print(x)")
+    server.run(str(nb))
+    session = server.registry.get(str(nb))
+    server.update_cell(str(nb), "load", _rev(nb, "load"), new_name="loader")
+    assert session.stale_names() == []
+
+
+@pytest.mark.kernel
+def test_background_run_preserves_external_edits(nb):
+    """Regression: the write-back after a background run saved the stale
+    in-memory model, clobbering anything a live editor saved mid-run."""
+    import json
+    import time as _time
+
+    server.add_cell(str(nb), "marker", "m = 'ORIGINAL'")
+    server.add_cell(str(nb), "slow", "import time\ntime.sleep(3)\nprint('slow done')")
+    server.run(str(nb), cells=["slow"], fresh_deps=False, wait_seconds=1)
+
+    raw = json.loads(nb.read_text())
+    for cell in raw["cells"]:
+        if "ORIGINAL" in "".join(cell["source"]):
+            cell["source"] = "m = 'EXTERNAL'"
+    nb.write_text(json.dumps(raw))
+
+    session = server.registry.get(str(nb))
+    deadline = _time.monotonic() + 15
+    while session.busy() and _time.monotonic() < deadline:
+        _time.sleep(0.2)
+    content = nb.read_text()
+    assert "EXTERNAL" in content  # the external edit survived
+    assert "slow done" in content  # and our outputs merged in cleanly
+
+
+def test_snapshot_dir_created_lazily(make_notebook):
+    """Regression: read paths created the snapshot cache dir eagerly and
+    failed outright on read-only filesystems."""
+    import jupyter_mcp.model as model_mod
+
+    path = make_notebook([("code", "x = 1")])
+    server.notebook_overview(str(path))
+    assert not model_mod.SNAPSHOT_ROOT.exists()  # reads need no cache access
+    session = server.registry.get(str(path))
+    ref = session.nbfile.refs()[0]
+    server.update_cell(str(path), ref.name, ref.rev, source="x = 2")
+    assert model_mod.SNAPSHOT_ROOT.exists()  # mutations snapshot as before
+
+
+@pytest.mark.kernel
+def test_undo_clears_freshness_stamps(nb):
+    """Regression: undo restored old stamps verbatim, so a cell could read
+    fresh while the live kernel held a later run's state."""
+    server.add_cell(str(nb), "a", "x = 1")
+    server.run(str(nb))
+    server.update_cell(str(nb), "a", _rev(nb, "a"), source="x = 2")
+    server.run(str(nb))
+    session = server.registry.get(str(nb))
+    assert session.stale_names() == []
+
+    server.undo_last(str(nb))  # pre-run-2: x = 2, unexecuted
+    server.undo_last(str(nb))  # pre-update: x = 1 WITH its old stamp
+    assert session.nbfile.get("a").cell.source == "x = 1"
+    assert "a" in session.stale_names()  # kernel holds x = 2 — must re-earn
+
+
+@pytest.mark.kernel
+def test_evict_during_run_never_resurrects_file(nb):
+    import time as _time
+
+    server.add_cell(str(nb), "slow", "import time\ntime.sleep(2)\nprint('done')")
+    server.run(str(nb), wait_seconds=1, timeout_seconds=10)
+    nb.unlink()
+    res = server.notebook_overview(str(nb))  # evicts + stops the session
+    assert isinstance(res, str) and res.startswith("ERROR")
+    deadline = _time.monotonic() + 6
+    while _time.monotonic() < deadline:
+        assert not nb.exists()
+        _time.sleep(0.3)

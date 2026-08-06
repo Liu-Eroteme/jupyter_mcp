@@ -106,8 +106,12 @@ class NotebookFile:
         self.nb: NotebookNode = None  # type: ignore[assignment]
         self._disk_sha: str | None = None
         # seed from disk so snapshots from a previous server process remain
-        # undoable (filenames sort chronologically)
-        self._undo_stack: list[Path] = sorted(self._snapshot_dir().glob("*.ipynb"))
+        # undoable (filenames sort chronologically); read paths must not
+        # require cache write access, so the dir is only created on snapshot()
+        snap_dir = self._snapshot_dir_path()
+        self._undo_stack: list[Path] = (
+            sorted(snap_dir.glob("*.ipynb")) if snap_dir.is_dir() else []
+        )
         self._names_dirty = False
 
     # ------------------------------------------------------------- loading
@@ -294,9 +298,12 @@ class NotebookFile:
 
     # ------------------------------------------------------------ snapshots
 
-    def _snapshot_dir(self) -> Path:
+    def _snapshot_dir_path(self) -> Path:
         digest = hashlib.sha256(str(self.path).encode()).hexdigest()[:12]
-        d = SNAPSHOT_ROOT / digest
+        return SNAPSHOT_ROOT / digest
+
+    def _snapshot_dir(self) -> Path:
+        d = self._snapshot_dir_path()
         d.mkdir(parents=True, exist_ok=True)
         return d
 
@@ -323,5 +330,14 @@ class NotebookFile:
                 self.path.write_bytes(snap.read_bytes())
                 snap.unlink(missing_ok=True)
                 self.load()
+                # restored freshness stamps may claim the live kernel matches
+                # sources it never ran — freshness must be re-earned
+                for cell in self.nb.cells:
+                    meta = cell.metadata.get(META_NS)
+                    if meta:
+                        meta.pop("last_exec_rev", None)
+                        meta.pop("last_exec_epoch", None)
+                        meta.pop("last_exec_deps", None)
+                self.save()
                 return snap.stem.split("-", 3)[-1]
         raise NothingToUndo()
