@@ -108,3 +108,30 @@ the standout feature.
 
 - Table row-count label still counts header + dtype lines ("11 rows"
   for a 9-row frame) — same as part 1.
+
+## Resolution round 2026-08-13
+
+All open items above were addressed (commits `fa9f734..93cd0f0`):
+
+- **Row miscounts** → labels count data rows only (header/dtype rows in
+  `<thead>` and all-`<th>` rows excluded).
+- **Implicit truncation** → labels read `showing 10 of 29,658 rows`
+  (declared shape parsed from pandas/polars HTML), or `showing N rows of
+  a longer table (total unknown)` when only ellipsis rows betray it.
+- **LLM summary trust** → LLM summaries now carry a `~` marker
+  (approximate) wherever they surface; `*` stays for deterministic
+  fallbacks (and stored fallbacks are now starred too).
+- **Per-cell timing** → run results show `## cell — ok (2.3s)`;
+  overview/read headers show `last run 2.3s`.
+- **Kernel binding at create** → `create_notebook` reports the resolved
+  interpreter (project venv path or fallback kernelspec).
+- **Notebook-level timeout/wait defaults** → new `configure_notebook`
+  tool; `run` resolves explicit arg > notebook default > global.
+- **Existing cell ids ignored** → human-meaningful kebab-case ids
+  (`fetch-gtfs`) are adopted as names; auto-generated hex/UUID ids are
+  not.
+- **Stale summaries after external edits** → `summarize_cells` flags
+  STALE cells; outputs of stale cells are labeled "from a previous run —
+  cell is stale" in both `summarize_cells` and `read_cells`.
+- **`quiet=true` swallowing requested prints** → explicitly-requested
+  cells keep full output; only auto-added stale ancestors collapse.
