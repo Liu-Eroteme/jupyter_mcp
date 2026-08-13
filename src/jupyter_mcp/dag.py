@@ -49,6 +49,7 @@ class CellDeps:
     mutates: set[str] = field(default_factory=set)
     wildcard_import: bool = False
     parse_error: str | None = None
+    opaque: bool = False  # non-python cell magic — dependencies unknowable
 
     @property
     def writes(self) -> set[str]:
@@ -346,7 +347,7 @@ def _free_names(node: ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.
 def analyze_source(source: str) -> CellDeps:
     stripped = strip_magics(source)
     if stripped is None:
-        return CellDeps()
+        return CellDeps(opaque=True)
     try:
         tree = ast.parse(stripped)
     except SyntaxError as e:

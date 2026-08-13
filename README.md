@@ -44,6 +44,7 @@ This server fixes each of those with an opinionated data model.
 | `undo_last` | Restore pre-mutation snapshot |
 | `summarize_cells` | Detailed LLM summaries incl. outputs |
 | `search_cells` | Search source + names + summaries |
+| `lint_notebook` | Static findings: syntax errors, undefined names, unused/shadowed definitions, opaque cells |
 | `kb_search` / `kb_get` / `kb_upsert` | Knowledge bundle: durable notes about data sources, tooling, recipes (see below) |
 
 ## Setup

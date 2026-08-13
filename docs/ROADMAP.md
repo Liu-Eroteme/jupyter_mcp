@@ -71,7 +71,9 @@ signal_timestamp"*. Each was rediscovered from scratch during EDA.
   snapshots.
 - ~~**Cell-level diff tool**~~ — rejected: revision locking already prevents
   blind overwrites, and the agent holds both source versions anyway.
-- **Notebook lint tool** as a first-class surface (currently footer notes):
-  use-before-def, unused definitions, opaque cells, missing names.
+- ~~**Notebook lint tool** as a first-class surface~~ — done 2026-08-13:
+  `lint_notebook` (syntax errors, use-before-def, unused/shadowed
+  definitions, opaque cells, empty cells); footer notes stay as the
+  inline hint.
 - **Export tools**: notebook → script / HTML report.
 - **Watch mode**: notify-on-external-change instead of reject-on-write.

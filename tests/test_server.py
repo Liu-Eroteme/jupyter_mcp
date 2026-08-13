@@ -616,6 +616,30 @@ def test_fresh_cell_outputs_not_stale_labeled(nb):
     assert "output:" in text and "previous run" not in text
 
 
+def test_lint_notebook(nb):
+    server.add_cell(str(nb), "config", "THRESHOLD = 5\nlimit = 10")
+    server.add_cell(str(nb), "use", "print(limit + undefined_thing)")
+    server.add_cell(str(nb), "shadow", "limit = 20")
+    server.add_cell(str(nb), "bash", "%%bash\necho hi")
+    server.add_cell(str(nb), "empty", "")
+    server.add_cell(str(nb), "broken", "def f(:")
+
+    out = server.lint_notebook(str(nb))
+    assert "[error] use: uses names never defined" in out and "undefined_thing" in out
+    assert "[error] broken: syntax error" in out
+    assert "[warn] bash: opaque to dependency tracking" in out
+    assert "[warn] 'limit' defined in 2 cells: config, shadow" in out
+    assert "[info] config: defines ['THRESHOLD']" in out
+    assert "[info] empty: empty cell" in out
+    assert out.startswith("lint: 2 errors, 2 warnings")
+
+
+def test_lint_notebook_clean(nb):
+    server.add_cell(str(nb), "a", "x = 1")
+    server.add_cell(str(nb), "b", "print(x)")
+    assert "No lint findings" in server.lint_notebook(str(nb))
+
+
 def test_create_notebook_reports_kernel_resolution(tmp_path, monkeypatch):
     """Feedback: which interpreter 'python3' resolves to was invisible until
     the first run; surface it at creation."""

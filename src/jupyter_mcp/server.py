@@ -21,7 +21,7 @@ from mcp.server.fastmcp import FastMCP, Image
 
 from . import kb as kb_mod
 from .condense import condense_outputs
-from .dag import NotebookGraph
+from .dag import CellDeps, NotebookGraph
 from .errors import JupyterMcpError
 from .kernel import DEFAULT_EXEC_TIMEOUT, find_project_python, inspect_code, resolve_kernel_name
 from .model import META_NS, CellRef, cell_meta
@@ -718,6 +718,77 @@ def search_cells(path: str, query: str, regex: bool = False) -> str:
         if matches:
             hits.append(f"[{ref.index}] {ref.name} (rev {ref.rev})\n" + "\n".join(matches))
     return "\n\n".join(hits) if hits else f"No matches for {query!r}."
+
+
+@mcp.tool()
+@_tool_errors
+def lint_notebook(path: str) -> str:
+    """Static lint of the whole notebook: syntax errors, names used but never
+    defined by an earlier cell (use-before-def, typos), definitions no other
+    cell uses, cells opaque to dependency tracking (%%bash etc.), empty
+    cells, and names defined by multiple cells (shadowing — the last writer
+    above a reader wins). Heuristics from the static DAG: a flagged name may
+    still resolve at runtime (dynamic globals, wildcard imports)."""
+    session = registry.get(path)
+    session.refresh_reads()
+    graph = session.graph()
+    code_refs = [r for r in session.nbfile.refs() if r.cell.cell_type == "code"]
+
+    errors: list[str] = []
+    warns: list[str] = []
+    infos: list[str] = []
+
+    for ref in code_refs:
+        deps = graph.deps.get(ref.name)
+        if deps is None:
+            continue
+        if deps.parse_error:
+            errors.append(f"[error] {ref.name}: syntax error ({deps.parse_error})")
+        if deps.opaque:
+            first = ref.cell.source.strip().splitlines()[0][:40] if ref.cell.source.strip() else ""
+            warns.append(
+                f"[warn] {ref.name}: opaque to dependency tracking ({first}) — "
+                "edits to its inputs won't mark it stale"
+            )
+        if not ref.cell.source.strip():
+            infos.append(f"[info] {ref.name}: empty cell")
+    for name, missing in graph.undefined.items():
+        errors.append(f"[error] {name}: uses names never defined in this notebook: {sorted(missing)}")
+
+    definers: dict[str, list[str]] = {}
+    for ref in code_refs:
+        for var in graph.deps.get(ref.name, CellDeps()).defines:
+            definers.setdefault(var, []).append(ref.name)
+    for var, cells in sorted(definers.items()):
+        if len(cells) > 1:
+            warns.append(f"[warn] {var!r} defined in {len(cells)} cells: {', '.join(cells)}")
+
+    all_uses: dict[str, set[str]] = {
+        r.name: graph.deps.get(r.name, CellDeps()).uses for r in code_refs
+    }
+    for ref in code_refs:
+        deps = graph.deps.get(ref.name)
+        if deps is None or deps.opaque or deps.parse_error:
+            continue
+        unused = {
+            var
+            for var in deps.defines
+            if not var.startswith("_")
+            and not any(var in uses for cell, uses in all_uses.items() if cell != ref.name)
+        }
+        if unused:
+            infos.append(
+                f"[info] {ref.name}: defines {sorted(unused)} — used by no other cell"
+            )
+
+    findings = errors + warns + infos
+    if not findings:
+        return f"No lint findings ({len(code_refs)} code cells, all parsed and resolved)."
+    counts = []
+    for label, bucket in (("error", errors), ("warning", warns), ("info", infos)):
+        if bucket:
+            counts.append(f"{len(bucket)} {label}{'s' if len(bucket) != 1 else ''}")
+    return f"lint: {', '.join(counts)}\n\n" + "\n".join(findings)
 
 
 # ------------------------------------------------------------ knowledge base
