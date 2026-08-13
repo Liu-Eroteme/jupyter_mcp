@@ -89,16 +89,25 @@ def resolve_bundle(bundle: str | None, *, create: bool = False) -> Path:
     return root
 
 
-def parse_entry_text(text: str) -> tuple[dict, str]:
-    """Split frontmatter and body; tolerant of malformed/missing YAML."""
+def _parse_raw(text: str) -> tuple[dict | None, str]:
+    """(frontmatter, body). Distinguishes the three cases: no frontmatter
+    ({}), well-formed ({...}), and a block that exists but is not a YAML
+    mapping (None) — writers must not treat the last one as empty."""
     m = _FRONTMATTER_RE.match(text)
     if not m:
         return {}, text
     try:
         meta = yaml.safe_load(m.group(1))
     except yaml.YAMLError:
-        return {}, text[m.end() :]
-    return (meta if isinstance(meta, dict) else {}), text[m.end() :]
+        return None, text[m.end() :]
+    return (meta if isinstance(meta, dict) else None), text[m.end() :]
+
+
+def parse_entry_text(text: str) -> tuple[dict, str]:
+    """Split frontmatter and body; tolerant of malformed/missing YAML
+    (read paths: a broken block degrades to an untyped entry)."""
+    meta, body = _parse_raw(text)
+    return ({} if meta is None else meta), body
 
 
 def load_bundle(root: Path) -> list[KbEntry]:
@@ -214,7 +223,17 @@ def upsert(
     meta: dict = {}
     old_body = ""
     if not created:
-        meta, old_body = parse_entry_text(target.read_text(encoding="utf-8"))
+        parsed, old_body = _parse_raw(target.read_text(encoding="utf-8"))
+        if parsed is None:
+            # bundles are hand-editable git repos — malformed YAML is the
+            # expected case, and rewriting through {} would destroy every
+            # existing field. Refuse instead of losing data.
+            raise JupyterMcpError(
+                f"Entry {rel!r} has frontmatter that does not parse as a YAML "
+                "mapping — updating it would lose the existing fields. Fix the "
+                "file by hand first (kb_get shows its raw content)."
+            )
+        meta = parsed
     meta["type"] = type
     for key, value in (
         ("title", title),
@@ -269,15 +288,17 @@ def _cell_identifiers(source: str) -> tuple[set[str], set[str]]:
 
 
 def _resource_matches(resource: str, literals: set[str]) -> bool:
-    """A KB resource URI matches a cell if some literal fnmatch-es it, or one
-    contains the other (covers absolute paths vs relative globs, table names
-    embedded in SQL strings)."""
+    """A KB resource URI matches a cell if some literal fnmatch-es it, or the
+    full resource appears inside a literal (table names embedded in SQL,
+    globs inside longer paths). Deliberately NOT the reverse — a short
+    literal that is merely a substring of the resource ('.txt' in
+    'gtfs/*.txt') says nothing about the cell touching that source."""
     pattern = resource.lower()
     for lit in literals:
         lowered = lit.lower()
         if fnmatch.fnmatch(lowered, pattern) or fnmatch.fnmatch(Path(lowered).name, pattern):
             return True
-        if len(pattern) >= 5 and (pattern in lowered or lowered in pattern):
+        if len(pattern) >= 5 and pattern in lowered:
             return True
     return False
 

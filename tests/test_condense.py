@@ -128,6 +128,53 @@ def test_header_only_table_falls_back_to_raw_count():
     assert text is not None and "2 rows" in text
 
 
+def test_empty_dataframe_reports_zero_rows():
+    """Review finding: an empty pandas frame reported its header row as
+    '1 rows' although the declared total (0) was right there in the HTML."""
+    html = (
+        "<div><table><thead><tr><th></th><th>a</th><th>b</th></tr></thead>"
+        "<tbody></tbody></table><p>0 rows × 2 columns</p></div>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None and "[table as CSV, 0 rows]" in text
+
+    # polars empty frame: two thead rows (names + dtypes), declared shape 0
+    html = (
+        "<div><small>shape: (0, 2)</small><table><thead><tr><th>a</th><th>b</th></tr>"
+        "<tr><td>i64</td><td>str</td></tr></thead><tbody></tbody></table></div>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None and "[table as CSV, 0 rows]" in text
+
+
+def test_unclosed_thead_does_not_swallow_body_rows():
+    """Review finding: omitted </thead> (legal HTML — tbody implicitly closes
+    it) left _in_thead sticky, so every body row was counted as a header."""
+    body = "".join(f"<tr><td>{i}</td></tr>" for i in range(5))
+    html = f"<table><thead><tr><th>a</th></tr><tbody>{body}</tbody></table>"
+    text = html_table_to_text(html)
+    assert text is not None and "[table as CSV, 5 rows]" in text
+
+
+def test_label_counts_emitted_rows_when_cap_fires():
+    """Review finding: the label counted parsed rows while the body was
+    capped at MAX_TABLE_ROWS — 'showing 200 of 29,658' above 49 rows."""
+    body = "".join(f"<tr><td>{i}</td></tr>" for i in range(200))
+    html = (
+        f"<div><table><thead><tr><th>a</th></tr></thead><tbody>{body}</tbody>"
+        "</table><p>29658 rows × 1 columns</p></div>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None
+    assert "showing 49 of 29,658 rows" in text  # 50 kept rows − 1 header
+    assert "more rows omitted" in text
+
+    # without a declared total, the parsed count is exact — use it
+    html = f"<table><thead><tr><th>a</th></tr></thead><tbody>{body}</tbody></table>"
+    text = html_table_to_text(html)
+    assert text is not None and "showing 49 of 200 rows" in text
+
+
 def test_mime_bundle_prefers_table_over_plain():
     html = "<table><tr><th>x</th></tr><tr><td>1</td></tr></table>"
     out = condense_outputs(

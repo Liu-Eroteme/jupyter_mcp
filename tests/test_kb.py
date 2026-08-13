@@ -105,6 +105,47 @@ def test_upsert_creates_updates_and_logs(bundle):
     assert "updated data-sources/omniplus.md (agent:claude)" in log
 
 
+def test_upsert_refuses_to_clobber_malformed_frontmatter(bundle):
+    """Review finding (high): a hand-edit typo in YAML made upsert rewrite
+    the entry with only the new fields — title/resource/tags silently lost."""
+    target = bundle / "data-sources" / "handmade.md"
+    target.write_text(
+        "---\n"
+        "type: Data Source\n"
+        "title: Handmade\n"
+        "resource: hand_*.csv\n"
+        "note: WARN: unquoted colon breaks yaml\n"
+        "---\n\nbody text\n"
+    )
+    original = target.read_text()
+    with pytest.raises(JupyterMcpError) as exc:
+        upsert(bundle, "data-sources/handmade", type="Data Source", description="new")
+    assert "does not parse" in str(exc.value)
+    assert target.read_text() == original  # nothing was lost
+
+    # non-dict frontmatter (a --- separator block) is protected the same way
+    target.write_text("---\n- just\n- a list\n---\n\nbody\n")
+    with pytest.raises(JupyterMcpError):
+        upsert(bundle, "data-sources/handmade", type="Tool")
+
+
+def test_crossref_ignores_literals_that_are_substrings_of_resource(bundle):
+    """Review finding: '.txt' in a cell matched resource 'gtfs/*.txt' via
+    reversed containment, crowding real hits out of the overview."""
+    entries = [
+        KbEntry("gtfs.md", {"type": "Data Source", "resource": "gtfs/*.txt"}, ""),
+        KbEntry("events.md", {"type": "Data Source", "resource": "analytics.events"}, ""),
+    ]
+    cells = [
+        ("unrelated-txt", "paths = [p for p in files if p.endswith('.txt')]"),
+        ("unrelated-cols", "df = df.rename({'events': 'n_events'})"),
+        ("real-hit", "q = 'select * from analytics.events limit 5'"),
+    ]
+    lines = crossref(entries, cells)
+    assert not any("unrelated" in ln for ln in lines)
+    assert any("real-hit" in ln and "events.md" in ln for ln in lines)
+
+
 def test_upsert_rejects_escapes_and_reserved(bundle):
     with pytest.raises(JupyterMcpError):
         upsert(bundle, "../evil", type="Tool")

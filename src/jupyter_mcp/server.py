@@ -66,7 +66,8 @@ def _deps_line(graph: NotebookGraph, name: str) -> str:
 
 def _fmt_secs(seconds: float) -> str:
     if seconds >= 90:
-        return f"{int(seconds // 60)}m{seconds % 60:02.0f}s"
+        minutes, secs = divmod(round(seconds), 60)  # divmod AFTER rounding: no "1m60s"
+        return f"{minutes}m{secs:02d}s"
     if seconds >= 10:
         return f"{seconds:.0f}s"
     return f"{seconds:.1f}s"
@@ -755,31 +756,54 @@ def lint_notebook(path: str) -> str:
     for name, missing in graph.undefined.items():
         errors.append(f"[error] {name}: uses names never defined in this notebook: {sorted(missing)}")
 
-    definers: dict[str, list[str]] = {}
-    for ref in code_refs:
-        for var in graph.deps.get(ref.name, CellDeps()).defines:
-            definers.setdefault(var, []).append(ref.name)
-    for var, cells in sorted(definers.items()):
-        if len(cells) > 1:
-            warns.append(f"[warn] {var!r} defined in {len(cells)} cells: {', '.join(cells)}")
-
     all_uses: dict[str, set[str]] = {
         r.name: graph.deps.get(r.name, CellDeps()).uses for r in code_refs
     }
+    used_anywhere: set[str] = set().union(*all_uses.values()) if all_uses else set()
+
+    # shadowing: only real hiding is worth a warning — multiple cells that
+    # bind a name WITHOUT reading it (a rebinding chain like `df = df.filter()`
+    # reads its predecessor, and loop targets nobody reads are just locals)
+    blind_definers: dict[str, list[str]] = {}
     for ref in code_refs:
-        deps = graph.deps.get(ref.name)
-        if deps is None or deps.opaque or deps.parse_error:
-            continue
-        unused = {
-            var
-            for var in deps.defines
-            if not var.startswith("_")
-            and not any(var in uses for cell, uses in all_uses.items() if cell != ref.name)
-        }
-        if unused:
-            infos.append(
-                f"[info] {ref.name}: defines {sorted(unused)} — used by no other cell"
+        deps = graph.deps.get(ref.name, CellDeps())
+        for var in deps.defines - deps.uses:
+            blind_definers.setdefault(var, []).append(ref.name)
+    for var, cells in sorted(blind_definers.items()):
+        if len(cells) > 1 and var in used_anywhere:
+            warns.append(
+                f"[warn] {var!r} defined independently in {len(cells)} cells: "
+                f"{', '.join(cells)} — readers below get the last one"
             )
+
+    # unused definitions are only provable when every cell's uses are known:
+    # an opaque or unparseable cell may consume anything (%%sql $DB_URL)
+    blind_spots = [
+        r.name
+        for r in code_refs
+        if graph.deps.get(r.name, CellDeps()).opaque
+        or graph.deps.get(r.name, CellDeps()).parse_error
+    ]
+    if blind_spots:
+        infos.append(
+            "[info] unused-definition check skipped: "
+            f"{', '.join(blind_spots)} cannot be analyzed, so uses are unknown"
+        )
+    else:
+        for ref in code_refs:
+            deps = graph.deps.get(ref.name)
+            if deps is None:
+                continue
+            unused = {
+                var
+                for var in deps.defines
+                if not var.startswith("_")
+                and not any(var in uses for cell, uses in all_uses.items() if cell != ref.name)
+            }
+            if unused:
+                infos.append(
+                    f"[info] {ref.name}: defines {sorted(unused)} — used by no other cell"
+                )
 
     findings = errors + warns + infos
     if not findings:

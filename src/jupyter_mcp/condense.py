@@ -86,6 +86,8 @@ class _TableParser(HTMLParser):
             return
         if tag == "thead":
             self._in_thead = True
+        elif tag in ("tbody", "tfoot"):
+            self._in_thead = False  # legal HTML may omit </thead>
         elif tag == "tr":
             self._row = []
             self._row_has_td = False
@@ -140,21 +142,31 @@ def _declared_row_count(html: str) -> int | None:
     return None
 
 
+def _data_row_stats(rows: list[list[str]], header_flags: list[bool]) -> tuple[int, int]:
+    """(real data rows, ellipsis-preview rows) among the given rows."""
+    data = [r for r, is_header in zip(rows, header_flags) if not is_header]
+    ellipsis = sum(1 for r in data if all(c.strip() in _ELLIPSIS_CELLS for c in r))
+    return len(data) - ellipsis, ellipsis
+
+
 def _row_count_label(html: str, rows: list[list[str]], header_flags: list[bool]) -> str:
-    """Honest row-count label: data rows only, truncated previews called out."""
-    data_rows = [r for r, is_header in zip(rows, header_flags) if not is_header]
-    ellipsis_rows = sum(
-        1 for r in data_rows if all(c.strip() in _ELLIPSIS_CELLS for c in r)
-    )
-    shown = len(data_rows) - ellipsis_rows
-    if shown <= 0:  # header-only table: nothing meaningful to distinguish
-        return f"{len(rows)} rows"
+    """Honest row-count label, computed over the rows actually EMITTED
+    (the MAX_TABLE_ROWS cap included): data rows only, truncated previews
+    called out with the declared total when the repr provides one."""
+    shown, _ = _data_row_stats(rows[:MAX_TABLE_ROWS], header_flags[:MAX_TABLE_ROWS])
+    parsed, parsed_ellipsis = _data_row_stats(rows, header_flags)
     declared = _declared_row_count(html)
+    if shown <= 0:
+        if declared is None:  # header-only table: nothing to distinguish
+            return f"{len(rows)} rows"
+        return "0 rows" if declared == 0 else f"showing 0 of {declared:,} rows"
     plural = "row" if shown == 1 else "rows"
     if declared is not None and declared > shown:
         return f"showing {shown} of {declared:,} rows"
-    if ellipsis_rows:
+    if parsed_ellipsis:  # the repr itself was a preview of unknown size
         return f"showing {shown} {plural} of a longer table (total unknown)"
+    if parsed > shown:  # only our own cap cut rows; the parsed count is exact
+        return f"showing {shown} of {parsed:,} rows"
     return f"{shown} {plural}"
 
 

@@ -35,6 +35,7 @@ from .errors import (
 META_NS = "jupyter_mcp"
 SNAPSHOT_ROOT = Path.home() / ".cache" / "jupyter_mcp" / "snapshots"
 MAX_SNAPSHOTS = 20
+MAX_DEFAULT_SECONDS = 86_400.0  # sanity cap for stored run defaults
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
 
@@ -179,25 +180,33 @@ class NotebookFile:
         _adoptable_id) so externally-authored notebooks stay addressable by
         the ids visible in the file; synthesizes from content otherwise.
 
+        Stored names are authoritative addresses (agents hold them across
+        calls), so they are all reserved up front: a newly adopted/derived
+        name can never displace a stored one, regardless of document order.
+
         Does not write to disk — a foreign notebook is only rewritten once the
         first real mutation happens.
         """
         changed = False
-        seen: set[str] = set()
+        stored = [cell_name(c) for c in self.nb.cells]
+        reserved: dict[str, int] = {}
+        for i, name in enumerate(stored):
+            if name and name not in reserved:
+                reserved[name] = i
+        assigned: set[str] = set()
         for i, cell in enumerate(self.nb.cells):
-            name = cell_name(cell)
+            name = stored[i]
             if not name:
                 name = _adoptable_id(cell) or _auto_name(cell, i)
                 changed = True
             base, n = name, 2
-            while name in seen:
+            while name in assigned or reserved.get(name, i) != i:
                 name = f"{base}-{n}"
                 n += 1
-                changed = changed or name != cell_name(cell)
             if name != cell_name(cell):
                 cell_meta(cell)["name"] = name
                 changed = True
-            seen.add(name)
+            assigned.add(name)
         return changed
 
     def _check_new_name(self, name: str) -> str:
@@ -214,9 +223,26 @@ class NotebookFile:
     # ------------------------------------------------------------ accessors
 
     def defaults(self) -> dict:
-        """Notebook-level tool defaults (set via configure_notebook)."""
+        """Notebook-level tool defaults (set via configure_notebook).
+
+        Metadata can be hand-edited or foreign-written: anything that is not
+        a positive finite number within the sanity cap is dropped, so a
+        malformed block degrades to the globals instead of breaking every
+        tool that formats or float()s these values.
+        """
         d = self.nb.metadata.get(META_NS, {}).get("defaults", {})
-        return d if isinstance(d, dict) else {}
+        if not isinstance(d, dict):
+            return {}
+        out: dict[str, float] = {}
+        for key in ("timeout_seconds", "wait_seconds"):
+            value = d.get(key)
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and 0 < value <= MAX_DEFAULT_SECONDS
+            ):
+                out[key] = float(value)
+        return out
 
     @property
     def cells(self) -> list[NotebookNode]:
@@ -294,8 +320,10 @@ class NotebookFile:
             if ref.cell.cell_type == "code":
                 ref.cell.outputs = []
                 ref.cell.execution_count = None
-                # the cached output summary describes outputs that no longer exist
+                # the cached output summary and timing describe a version of
+                # the cell that no longer exists
                 cell_meta(ref.cell).pop("output_summary", None)
+                cell_meta(ref.cell).pop("last_exec_seconds", None)
         return CellRef(ref.index, ref.cell)
 
     def remove_cell(self, name: str, expected_rev: str) -> None:
@@ -365,6 +393,7 @@ class NotebookFile:
                         meta.pop("last_exec_rev", None)
                         meta.pop("last_exec_epoch", None)
                         meta.pop("last_exec_deps", None)
+                        meta.pop("last_exec_seconds", None)
                 self.save()
                 return snap.stem.split("-", 3)[-1]
         raise NothingToUndo()

@@ -548,6 +548,32 @@ def test_quiet_keeps_requested_cell_output(nb):
     assert "## load — ok" in text
 
 
+def test_fmt_secs_boundaries():
+    """Review finding: :02.0f rounded the seconds slot up to 60 ('1m60s')."""
+    assert server._fmt_secs(119.6) == "2m00s"
+    assert server._fmt_secs(3599.7) == "60m00s"
+    assert server._fmt_secs(90) == "1m30s"
+    assert server._fmt_secs(42.3) == "42s"
+    assert server._fmt_secs(2.34) == "2.3s"
+
+
+def test_tools_survive_malformed_defaults_metadata(nb):
+    """Review finding: null/string defaults made overview/run/configure
+    return opaque internal TypeErrors — the notebook was unopenable."""
+    import json
+
+    raw = json.loads(nb.read_text())
+    raw["metadata"]["jupyter_mcp"] = {"defaults": {"timeout_seconds": None, "wait_seconds": "90"}}
+    nb.write_text(json.dumps(raw))
+
+    server.add_cell(str(nb), "a", "x = 1")
+    overview = server.notebook_overview(str(nb), refresh_summaries=False)
+    assert overview.startswith("#") and "run defaults" not in overview
+    assert "no notebook defaults" in server.configure_notebook(str(nb))
+    out = server.configure_notebook(str(nb), default_timeout_seconds=60)
+    assert not out.startswith("ERROR") and "timeout 60s" in out
+
+
 def test_configure_notebook_defaults(nb):
     assert "no notebook defaults" in server.configure_notebook(str(nb))
 
@@ -628,10 +654,35 @@ def test_lint_notebook(nb):
     assert "[error] use: uses names never defined" in out and "undefined_thing" in out
     assert "[error] broken: syntax error" in out
     assert "[warn] bash: opaque to dependency tracking" in out
-    assert "[warn] 'limit' defined in 2 cells: config, shadow" in out
-    assert "[info] config: defines ['THRESHOLD']" in out
+    assert "[warn] 'limit' defined independently in 2 cells: config, shadow" in out
     assert "[info] empty: empty cell" in out
+    # opaque + broken cells may consume anything — unused check must not fire
+    assert "THRESHOLD" not in out
+    assert "unused-definition check skipped" in out
     assert out.startswith("lint: 2 errors, 2 warnings")
+
+
+def test_lint_unused_definitions_when_fully_analyzable(nb):
+    server.add_cell(str(nb), "config", "THRESHOLD = 5\nlimit = 10")
+    server.add_cell(str(nb), "use", "print(limit)")
+    out = server.lint_notebook(str(nb))
+    assert "[info] config: defines ['THRESHOLD'] — used by no other cell" in out
+
+
+def test_lint_rebinding_chains_are_not_shadowing(nb):
+    """Review finding: `df = df.filter(...)` chains, loop targets, and
+    accumulators are the most common notebook shapes — not shadowing."""
+    server.add_cell(str(nb), "load", "df = read(src)")
+    server.add_cell(str(nb), "clean", "df = df.head()")
+    server.add_cell(str(nb), "enrich", "df = df.upper()")
+    server.add_cell(str(nb), "loop1", "for row in df:\n    print(row)")
+    server.add_cell(str(nb), "loop2", "for row in df:\n    pass")
+    server.add_cell(str(nb), "acc", "total = 0")
+    server.add_cell(str(nb), "acc2", "total += 1")
+    out = server.lint_notebook(str(nb))
+    assert "'df' defined" not in out
+    assert "'row' defined" not in out
+    assert "'total' defined" not in out
 
 
 def test_lint_notebook_clean(nb):

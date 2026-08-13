@@ -62,6 +62,59 @@ def test_meaningful_cell_ids_adopted_as_names(make_notebook):
     assert names[3] == "y-2"
 
 
+def test_adopted_id_never_displaces_stored_name(make_notebook):
+    """Review finding: an earlier unnamed cell adopting id 'setup' stole the
+    name from a later cell that already stored it — silently re-pointing
+    run(cells=['setup']) at the wrong cell."""
+    import json
+
+    path = make_notebook([("code", "a = 1"), ("code", "b = 2")])
+    raw = json.loads(path.read_text())
+    raw["cells"][0]["id"] = "setup"  # unnamed, adoptable id
+    raw["cells"][1]["metadata"]["jupyter_mcp"] = {"name": "setup"}  # stored address
+    path.write_text(json.dumps(raw))
+
+    nbf = load(path)
+    assert nbf.names() == ["setup-2", "setup"]
+    assert nbf.get("setup").cell.source == "b = 2"  # the stored address held
+
+
+def test_malformed_defaults_metadata_degrades_to_globals(make_notebook):
+    """Review finding: hand-edited defaults (null / strings / negatives)
+    crashed overview, run and configure_notebook with internal TypeErrors."""
+    import json
+
+    path = make_notebook([("code", "x = 1")])
+    raw = json.loads(path.read_text())
+    raw["metadata"]["jupyter_mcp"] = {
+        "defaults": {
+            "timeout_seconds": None,
+            "wait_seconds": "90",
+            "bogus_key": 5,
+        }
+    }
+    path.write_text(json.dumps(raw))
+    nbf = load(path)
+    assert nbf.defaults() == {}
+
+    raw["metadata"]["jupyter_mcp"]["defaults"] = {"timeout_seconds": -1, "wait_seconds": 30}
+    path.write_text(json.dumps(raw))
+    assert load(path).defaults() == {"wait_seconds": 30.0}
+
+
+def test_update_cell_clears_stale_timing(make_notebook):
+    """Review finding: last_exec_seconds survived source edits, attributing
+    the old code's runtime to freshly rewritten code."""
+    from jupyter_mcp.model import cell_meta
+
+    path = make_notebook([("code", "import time\ntime.sleep(42)")])
+    nbf = load(path)
+    name = nbf.names()[0]
+    cell_meta(nbf.get(name).cell)["last_exec_seconds"] = 42.3
+    nbf.update_cell(name, nbf.get(name).rev, source="x = 1")
+    assert "last_exec_seconds" not in cell_meta(nbf.get(name).cell)
+
+
 def test_adopted_id_colliding_with_existing_name_deduped(make_notebook):
     # (nbformat corrects duplicate *ids* to random hex on load itself, so the
     # collision that can actually reach us is id vs. stored metadata name)
