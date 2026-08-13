@@ -1,5 +1,7 @@
 """End-to-end tests through the MCP tool functions, including a real kernel."""
 
+import re
+
 import pytest
 
 from jupyter_mcp import server
@@ -141,7 +143,7 @@ def test_staleness_scoped_to_kernel_epoch(nb, tmp_path):
     # and executing through the fresh session must include upstream cells
     results = fresh.execute_cells(fresh.stale_names())
     try:
-        assert [(name, status) for name, status, _ in results] == [
+        assert [(r.name, r.status) for r in results] == [
             ("load", "ok"),
             ("use", "ok"),
         ]
@@ -513,6 +515,74 @@ def test_inspect_rich_reprs(nb):
     from mcp.server.fastmcp import Image
 
     assert any(isinstance(b, Image) for b in out)
+
+
+# -------------------------------------------------- feedback-round fixes
+
+
+@pytest.mark.kernel
+def test_run_reports_per_cell_timing(nb):
+    """Feedback: when a chain runs, show which cell ate the wall clock."""
+    server.add_cell(str(nb), "quick", "print('hi')")
+    blocks = server.run(str(nb))
+    text = "\n".join(b for b in blocks if isinstance(b, str))
+    assert re.search(r"## quick — ok \(\d+(\.\d+)?s\)", text)
+
+    overview = server.notebook_overview(str(nb), refresh_summaries=False)
+    assert re.search(r"quick.*last run \d", overview)
+
+
+@pytest.mark.kernel
+def test_quiet_keeps_requested_cell_output(nb):
+    """Feedback: quiet=true swallowed the explicitly-requested cell's prints;
+    only the auto-added ancestors should collapse."""
+    server.add_cell(str(nb), "load", "data = [1, 2, 3]\nprint('loaded!')")
+    server.add_cell(str(nb), "use", "print('sum', sum(data))")
+    blocks = server.run(str(nb), cells=["use"], quiet=True)
+    text = "\n".join(b for b in blocks if isinstance(b, str))
+    assert "sum 6" in text  # the requested cell's stdout came through
+    assert "loaded!" not in text  # the stale ancestor collapsed
+    assert "## load — ok" in text
+
+
+def test_configure_notebook_defaults(nb):
+    assert "no notebook defaults" in server.configure_notebook(str(nb))
+
+    out = server.configure_notebook(
+        str(nb), default_timeout_seconds=300, default_wait_seconds=90
+    )
+    assert "timeout 300s" in out and "wait 90s" in out
+    assert "run defaults" in server.notebook_overview(str(nb), refresh_summaries=False)
+
+    # persisted: a fresh load sees them
+    nbf = NotebookFile(nb)
+    nbf.load()
+    assert nbf.defaults() == {"timeout_seconds": 300, "wait_seconds": 90}
+
+    # 0 clears one default, the other survives
+    out = server.configure_notebook(str(nb), default_timeout_seconds=0)
+    assert "timeout" not in out and "wait 90s" in out
+
+    res = server.configure_notebook(str(nb), default_wait_seconds=-5)
+    assert res.startswith("ERROR")
+
+
+@pytest.mark.kernel
+def test_notebook_default_wait_applies(nb):
+    import time as _time
+
+    server.configure_notebook(str(nb), default_wait_seconds=1)
+    server.add_cell(str(nb), "slow", "import time\ntime.sleep(8)\nprint('done')")
+    blocks = server.run(str(nb))  # no wait_seconds passed — notebook default
+    text = "\n".join(b for b in blocks if isinstance(b, str))
+    assert "background" in text and "running: slow" in text
+
+    server.interrupt(str(nb))
+    session = server.registry.get(str(nb))
+    deadline = _time.monotonic() + 15
+    while session.busy() and _time.monotonic() < deadline:
+        _time.sleep(0.2)
+    assert not session.busy()
 
 
 # ------------------------------------------- round 5: codex review findings

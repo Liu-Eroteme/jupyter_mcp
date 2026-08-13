@@ -6,6 +6,7 @@ import atexit
 import hashlib
 import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, TypeVar, cast
 
@@ -15,11 +16,21 @@ from .condense import Condensed, condense_outputs
 from .dag import NotebookGraph, build_graph
 from .errors import CellNotFound, ExternalModification, JupyterMcpError
 from .kernel import DEFAULT_EXEC_TIMEOUT, KERNEL_IDLE_TTL, KernelSession
-from .model import META_NS, CellRef, NotebookFile, cell_meta
+from .model import CellRef, NotebookFile, cell_meta
 from .summaries import Summarizer
 from .tasks import Batch, ExecTask, Executor
 
 T = TypeVar("T")
+
+
+@dataclass
+class CellResult:
+    """One executed (or skipped) cell, ready for rendering."""
+
+    name: str
+    status: str
+    condensed: Condensed
+    duration: float | None = None  # wall-clock seconds; None if never ran
 
 
 def _dep_signature(name: str, graph: NotebookGraph, ids: dict[str, str]) -> str:
@@ -235,22 +246,24 @@ class NotebookSession:
 
     def execute_cells(
         self, names: list[str], timeout: float = DEFAULT_EXEC_TIMEOUT
-    ) -> list[tuple[str, str, Condensed]]:
+    ) -> list[CellResult]:
         """Submit and wait to completion (synchronous façade over the executor)."""
         batch = self.submit_cells(names, timeout)
         batch.wait(None)
         return self.batch_results(batch)
 
-    def batch_results(self, batch: Batch) -> list[tuple[str, str, Condensed]]:
-        results: list[tuple[str, str, Condensed]] = []
+    def batch_results(self, batch: Batch) -> list[CellResult]:
+        results: list[CellResult] = []
         for task in batch.tasks:
             if task.status in ("skipped", "cancelled", "superseded"):
-                results.append((task.name, task.status, Condensed(text=f"({task.note or task.status})")))
+                results.append(
+                    CellResult(task.name, task.status, Condensed(text=f"({task.note or task.status})"))
+                )
                 continue
             condensed = condense_outputs(task.buffer.snapshot())
             if task.note:
                 condensed.text = f"[{task.note}]\n{condensed.text}"
-            results.append((task.name, task.status, condensed))
+            results.append(CellResult(task.name, task.status, condensed, task.duration))
         return results
 
     def run_adhoc(self, code: str, timeout: float) -> ExecTask:
@@ -301,6 +314,7 @@ class NotebookSession:
         kernel.ensure_started()  # epoch must exist before stamping freshness
         task.status, task.started_at = "running", time.monotonic()
         res = kernel.execute(task.code, timeout=task.timeout, buffer=task.buffer)
+        elapsed = task.elapsed()
         task.status, task.note = res.status, res.note
         task.execution_count = res.execution_count
         with self._lock:
@@ -325,6 +339,9 @@ class NotebookSession:
                 meta.pop("last_exec_rev", None)
                 meta.pop("last_exec_epoch", None)
                 meta.pop("output_summary", None)
+                # informational, not a freshness stamp: how long the last
+                # attempt took (guides optimization of slow chains)
+                meta["last_exec_seconds"] = round(elapsed, 1)
                 if res.status == "ok":
                     graph = self.graph()
                     ids = {r.name: str(r.cell.get("id", r.name)) for r in self.nbfile.refs()}

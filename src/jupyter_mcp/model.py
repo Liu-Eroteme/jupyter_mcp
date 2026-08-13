@@ -191,6 +191,11 @@ class NotebookFile:
 
     # ------------------------------------------------------------ accessors
 
+    def defaults(self) -> dict:
+        """Notebook-level tool defaults (set via configure_notebook)."""
+        d = self.nb.metadata.get(META_NS, {}).get("defaults", {})
+        return d if isinstance(d, dict) else {}
+
     @property
     def cells(self) -> list[NotebookNode]:
         return self.nb.cells

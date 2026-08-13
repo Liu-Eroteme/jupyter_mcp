@@ -152,6 +152,7 @@ class ExecTask:
     execution_count: int | None = None
     buffer: OutputBuffer = field(default_factory=OutputBuffer)
     started_at: float | None = None
+    duration: float | None = None  # wall-clock seconds, set on completion
     done: threading.Event = field(default_factory=threading.Event)
 
     def elapsed(self) -> float:
@@ -231,6 +232,8 @@ class Executor:
                 task.note = f"{type(e).__name__}: {e}"
                 task.batch.failed = True
             finally:
+                if task.started_at is not None:
+                    task.duration = time.monotonic() - task.started_at
                 with self._cond:
                     self._current = None
                 task.done.set()

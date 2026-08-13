@@ -18,16 +18,19 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
-from .condense import Condensed, condense_outputs
+from .condense import condense_outputs
 from .dag import NotebookGraph
 from .errors import JupyterMcpError
-from .kernel import inspect_code
-from .model import CellRef, cell_meta
-from .session import NotebookSession, Registry
+from .kernel import DEFAULT_EXEC_TIMEOUT, inspect_code
+from .model import META_NS, CellRef, cell_meta
+from .session import CellResult, NotebookSession, Registry
 from .summaries import get_summary, get_tldr, output_hash
 
 mcp = FastMCP("jupyter-eda")
 registry = Registry()
+
+DEFAULT_WAIT_SECONDS = 60.0
+MAX_DEFAULT_SECONDS = 86_400.0  # sanity cap for configure_notebook values
 
 
 def _tool_errors(fn):
@@ -59,6 +62,19 @@ def _deps_line(graph: NotebookGraph, name: str) -> str:
     return " | ".join(parts) if parts else "(no dependencies)"
 
 
+def _fmt_secs(seconds: float) -> str:
+    if seconds >= 90:
+        return f"{int(seconds // 60)}m{seconds % 60:02.0f}s"
+    if seconds >= 10:
+        return f"{seconds:.0f}s"
+    return f"{seconds:.1f}s"
+
+
+def _last_run_secs(ref: CellRef) -> float | None:
+    secs = cell_meta(ref.cell).get("last_exec_seconds")
+    return secs if isinstance(secs, (int, float)) else None
+
+
 def _cell_header(session: NotebookSession, ref: CellRef, graph: NotebookGraph, stale: set[str]) -> str:
     flags = [ref.cell.cell_type]
     if ref.name in stale:
@@ -66,6 +82,9 @@ def _cell_header(session: NotebookSession, ref: CellRef, graph: NotebookGraph, s
     ec = ref.cell.get("execution_count")
     if ec:
         flags.append(f"exec#{ec}")
+    secs = _last_run_secs(ref)
+    if secs is not None:
+        flags.append(f"last run {_fmt_secs(secs)}")
     return f"[{ref.index}] {ref.name}  (rev {ref.rev}; {', '.join(flags)})"
 
 
@@ -151,6 +170,54 @@ def create_notebook(path: str, kernel_name: str = "python3") -> str:
 
 @mcp.tool()
 @_tool_errors
+def configure_notebook(
+    path: str,
+    default_timeout_seconds: float | None = None,
+    default_wait_seconds: float | None = None,
+) -> str:
+    """Set notebook-level defaults for run's timeout_seconds / wait_seconds,
+    used whenever a run call doesn't pass them explicitly. Pass 0 to clear a
+    default back to the global (timeout 120s, wait 60s); pass nothing to just
+    report the current defaults. Stored in notebook metadata (undoable)."""
+    session = registry.get(path)
+
+    def describe() -> str:
+        d = session.nbfile.defaults()
+        if not d:
+            return "no notebook defaults set (globals: timeout 120s, wait 60s)"
+        parts = [f"{k.removesuffix('_seconds')} {v:g}s" for k, v in sorted(d.items())]
+        return f"defaults: {', '.join(parts)}"
+
+    updates = {
+        "timeout_seconds": default_timeout_seconds,
+        "wait_seconds": default_wait_seconds,
+    }
+    if all(v is None for v in updates.values()):
+        session.refresh_reads()
+        return describe()
+    for key, value in updates.items():
+        if value is not None and not (0 <= value <= MAX_DEFAULT_SECONDS):
+            raise JupyterMcpError(f"default_{key} must be between 0 and {MAX_DEFAULT_SECONDS:g}.")
+
+    def apply() -> None:
+        meta = session.nbfile.nb.metadata.setdefault(META_NS, {})
+        defaults = meta.setdefault("defaults", {})
+        for key, value in updates.items():
+            if value is None:
+                continue
+            if value == 0:
+                defaults.pop(key, None)
+            else:
+                defaults[key] = value
+        if not defaults:
+            meta.pop("defaults", None)
+
+    session.mutate("configure-defaults", apply)
+    return f"Updated. Now: {describe()}"
+
+
+@mcp.tool()
+@_tool_errors
 def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
     """Index of the notebook: one line per cell (index, name, revision,
     staleness, one-line summary) plus dependency edges and lint findings.
@@ -178,6 +245,10 @@ def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
         f"# {session.path} — {len(session.nbfile.cells)} cells",
         f"kernel: {kernel_line}",
     ]
+    nb_defaults = session.nbfile.defaults()
+    if nb_defaults:
+        parts = [f"{k.removesuffix('_seconds')} {v:g}s" for k, v in sorted(nb_defaults.items())]
+        lines.append(f"run defaults (configure_notebook): {', '.join(parts)}")
     for ref in session.nbfile.refs():
         if current is not None and ref.name == current.name:
             marker = " RUNNING"
@@ -187,8 +258,10 @@ def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
             marker = " STALE"
         else:
             marker = ""
+        secs = _last_run_secs(ref)
+        timing = f"; last run {_fmt_secs(secs)}" if secs is not None else ""
         lines.append(
-            f"[{ref.index:>2}] {ref.name}  (rev {ref.rev}; {ref.cell.cell_type}{marker})"
+            f"[{ref.index:>2}] {ref.name}  (rev {ref.rev}; {ref.cell.cell_type}{timing}{marker})"
         )
         lines.append(f"     {get_tldr(ref.cell)}")
         if ref.cell.cell_type == "code" and graph.parents.get(ref.name):
@@ -241,6 +314,24 @@ def read_cells(
     return blocks
 
 
+def _exec_params(
+    session: NotebookSession, timeout_seconds: float | None, wait_seconds: float | None
+) -> tuple[float, float]:
+    """Resolve execution timing: explicit arg > notebook default > global."""
+    defaults = session.nbfile.defaults()
+    timeout = (
+        timeout_seconds
+        if timeout_seconds is not None
+        else defaults.get("timeout_seconds", DEFAULT_EXEC_TIMEOUT)
+    )
+    wait = (
+        wait_seconds
+        if wait_seconds is not None
+        else defaults.get("wait_seconds", DEFAULT_WAIT_SECONDS)
+    )
+    return float(timeout), float(wait)
+
+
 def _after_mutation(session: NotebookSession, header: str, focus: str, run: str):
     """Shared tail for add/update: either report, or fold in a stale run."""
     if run not in ("none", "stale"):
@@ -249,7 +340,8 @@ def _after_mutation(session: NotebookSession, header: str, focus: str, run: str)
         stale = session.stale_names()
         if not stale:
             return f"{header}\nNothing is stale — no cells executed."
-        blocks = _run_and_render(session, stale, timeout_seconds=120, quiet=False, wait_seconds=60)
+        timeout, wait = _exec_params(session, None, None)
+        blocks = _run_and_render(session, stale, timeout_seconds=timeout, quiet=False, wait_seconds=wait)
         if blocks and isinstance(blocks[0], str):
             blocks[0] = f"{header}\n\n{blocks[0]}"
         else:
@@ -338,9 +430,9 @@ def run(
     path: str,
     cells: list[str] | None = None,
     fresh_deps: bool = True,
-    timeout_seconds: float = 120,
+    timeout_seconds: float | None = None,
     quiet: bool = False,
-    wait_seconds: float = 60,
+    wait_seconds: float | None = None,
 ) -> list:
     """Execute cells on the notebook's persistent kernel.
 
@@ -349,12 +441,15 @@ def run(
     (API calls, randomness), preceded by their stale ancestors so inputs are
     trustworthy (`fresh_deps=false` skips the ancestor pass). Outputs are
     persisted and returned condensed; charts come back as images; `quiet`
-    collapses ok cells to status lines. If everything finishes within
-    `wait_seconds` you get full results; otherwise execution continues in the
-    background — watch it via notebook_overview / read_cells (live output),
-    stop it via interrupt."""
+    collapses ok cells to status lines, except cells you named in `cells` —
+    their output always comes through. `timeout_seconds`/`wait_seconds`
+    fall back to notebook defaults (configure_notebook), then 120s/60s.
+    If everything finishes within `wait_seconds` you get full results;
+    otherwise execution continues in the background — watch it via
+    notebook_overview / read_cells (live output), stop it via interrupt."""
     session = registry.get(path)
     session.refresh_reads()
+    timeout, wait = _exec_params(session, timeout_seconds, wait_seconds)
     graph = session.graph()
     stale = session.stale_names(graph)
     if cells is None:
@@ -375,7 +470,7 @@ def run(
                 upstream |= graph.ancestors(c)
             wanted |= upstream & set(stale)
         targets = [r.name for r in session.nbfile.refs() if r.name in wanted]
-    return _run_and_render(session, targets, timeout_seconds, quiet, wait_seconds)
+    return _run_and_render(session, targets, timeout, quiet, wait, always_full=set(cells or ()))
 
 
 @mcp.tool()
@@ -394,10 +489,13 @@ def _run_and_render(
     timeout_seconds: float,
     quiet: bool,
     wait_seconds: float,
+    always_full: set[str] = frozenset(),
 ) -> list:
     batch = session.submit_cells(names, timeout=timeout_seconds)
     if batch.wait(wait_seconds):
-        return _render_exec_results(session, session.batch_results(batch), quiet=quiet)
+        return _render_exec_results(
+            session, session.batch_results(batch), quiet=quiet, always_full=always_full
+        )
     return [_progress_snapshot(batch, wait_seconds)]
 
 
@@ -422,21 +520,24 @@ def _progress_snapshot(batch, waited: float) -> str:
 
 def _render_exec_results(
     session: NotebookSession,
-    results: list[tuple[str, str, Condensed]],
+    results: list[CellResult],
     quiet: bool = False,
+    always_full: set[str] = frozenset(),
 ) -> list:
     blocks: list = []
     text_parts: list[str] = []
-    for name, status, condensed in results:
+    for result in results:
+        name, status, condensed = result.name, result.status, result.condensed
         rev = ""
         try:
             rev = f" rev {session.nbfile.get(name).rev};"
         except JupyterMcpError:
             pass
-        if quiet and status == "ok":
-            text_parts.append(f"## {name} — ok{rev}")
+        took = f" ({_fmt_secs(result.duration)})" if result.duration is not None else ""
+        if quiet and status == "ok" and name not in always_full:
+            text_parts.append(f"## {name} — ok{took}{rev}")
         else:
-            text_parts.append(f"## {name} — {status}{rev}\n{condensed.text}")
+            text_parts.append(f"## {name} — {status}{took}{rev}\n{condensed.text}")
         for png in condensed.images:
             blocks.append("\n\n".join(text_parts))
             text_parts = []
