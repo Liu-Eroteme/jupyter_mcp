@@ -57,14 +57,22 @@ def truncate(text: str, max_chars: int = MAX_OUTPUT_CHARS) -> str:
 
 
 class _TableParser(HTMLParser):
-    """Extract the first <table> as rows of cell strings; bail on complexity."""
+    """Extract the first <table> as rows of cell strings; bail on complexity.
+
+    Header rows (inside <thead>, or consisting solely of <th> cells) are
+    tracked separately so row counts can honestly report *data* rows —
+    pandas puts column names in <thead>, polars adds a dtype row there too.
+    """
 
     def __init__(self) -> None:
         super().__init__()
         self.rows: list[list[str]] = []
+        self.header_flags: list[bool] = []  # parallel to rows
         self._row: list[str] | None = None
+        self._row_has_td = False
         self._cell: list[str] | None = None
         self._table_depth = 0
+        self._in_thead = False
         self.bailed = False
 
     def handle_starttag(self, tag: str, attrs: list) -> None:
@@ -76,12 +84,17 @@ class _TableParser(HTMLParser):
                 self.bailed = True  # nested table
         if self._table_depth != 1:
             return
-        if tag == "tr":
+        if tag == "thead":
+            self._in_thead = True
+        elif tag == "tr":
             self._row = []
+            self._row_has_td = False
         elif tag in ("td", "th"):
             if any(k in ("colspan", "rowspan") for k, _ in attrs):
                 self.bailed = True
                 return
+            if tag == "td":
+                self._row_has_td = True
             self._cell = []
 
     def handle_endtag(self, tag: str) -> None:
@@ -91,18 +104,58 @@ class _TableParser(HTMLParser):
             self._table_depth -= 1
         if self._table_depth < 1 and tag == "table":
             return
-        if tag in ("td", "th") and self._cell is not None:
+        if tag == "thead":
+            self._in_thead = False
+        elif tag in ("td", "th") and self._cell is not None:
             if self._row is not None:
                 self._row.append("".join(self._cell).strip())
             self._cell = None
         elif tag == "tr" and self._row is not None:
             if self._row:
                 self.rows.append(self._row)
+                self.header_flags.append(self._in_thead or not self._row_has_td)
             self._row = None
 
     def handle_data(self, data: str) -> None:
         if self._cell is not None:
             self._cell.append(data)
+
+
+#: row-count declarations that pandas/polars embed next to the table
+_SHAPE_MARKER_RES = (
+    re.compile(r"(\d[\d,_]*)\s*rows\s*[×x]\s*\d[\d,_]*\s*columns", re.IGNORECASE),
+    re.compile(r"shape:\s*\((\d[\d,_]*),"),
+)
+
+#: cell contents marking a truncated-preview row (HTMLParser decodes &hellip;)
+_ELLIPSIS_CELLS = frozenset({"...", "…", "⋮"})
+
+
+def _declared_row_count(html: str) -> int | None:
+    """The object's own row count, when the repr declares it (pandas/polars)."""
+    for pattern in _SHAPE_MARKER_RES:
+        m = pattern.search(html)
+        if m:
+            return int(re.sub(r"[,_]", "", m.group(1)))
+    return None
+
+
+def _row_count_label(html: str, rows: list[list[str]], header_flags: list[bool]) -> str:
+    """Honest row-count label: data rows only, truncated previews called out."""
+    data_rows = [r for r, is_header in zip(rows, header_flags) if not is_header]
+    ellipsis_rows = sum(
+        1 for r in data_rows if all(c.strip() in _ELLIPSIS_CELLS for c in r)
+    )
+    shown = len(data_rows) - ellipsis_rows
+    if shown <= 0:  # header-only table: nothing meaningful to distinguish
+        return f"{len(rows)} rows"
+    declared = _declared_row_count(html)
+    plural = "row" if shown == 1 else "rows"
+    if declared is not None and declared > shown:
+        return f"showing {shown} of {declared:,} rows"
+    if ellipsis_rows:
+        return f"showing {shown} {plural} of a longer table (total unknown)"
+    return f"{shown} {plural}"
 
 
 def html_table_to_text(html: str) -> str | None:
@@ -115,6 +168,7 @@ def html_table_to_text(html: str) -> str | None:
     rows = parser.rows
     if parser.bailed or not rows:
         return None
+    count_label = _row_count_label(html, rows, parser.header_flags)
     shown = rows[:MAX_TABLE_ROWS]
     trailer = f"\n… [{len(rows) - MAX_TABLE_ROWS} more rows omitted] …" if len(rows) > MAX_TABLE_ROWS else ""
     widths = {len(r) for r in shown}
@@ -122,9 +176,9 @@ def html_table_to_text(html: str) -> str | None:
         buf = io.StringIO()
         writer = csv.writer(buf, lineterminator="\n")
         writer.writerows(shown)
-        return f"[table as CSV, {len(rows)} rows]\n{buf.getvalue().rstrip()}{trailer}"
+        return f"[table as CSV, {count_label}]\n{buf.getvalue().rstrip()}{trailer}"
     payload = json.dumps(shown, ensure_ascii=False)
-    return f"[ragged table as JSON rows, {len(rows)} rows]\n{payload}{trailer}"
+    return f"[ragged table as JSON rows, {count_label}]\n{payload}{trailer}"
 
 
 # ------------------------------------------------------------------ images

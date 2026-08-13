@@ -68,6 +68,66 @@ def test_complex_table_bails():
     assert html_table_to_text(html) is None
 
 
+def test_row_count_excludes_headers():
+    """Regression (feedback): a 10-data-row polars table announced '12 rows'
+    because the column-name and dtype rows in <thead> were counted."""
+    body = "".join(f"<tr><td>{i}</td><td>x</td></tr>" for i in range(10))
+    html = (
+        "<small>shape: (10, 2)</small>"
+        "<table><thead><tr><th>a</th><th>b</th></tr>"
+        "<tr><td>i64</td><td>str</td></tr></thead>"
+        f"<tbody>{body}</tbody></table>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None
+    assert "[table as CSV, 10 rows]" in text
+    assert "i64,str" in text  # dtype row still shown, just not counted
+
+
+def test_truncated_pandas_preview_reports_full_size():
+    """Regression (feedback): a 29,658-row frame rendered 10 rows with no
+    marker — the preview read as the whole table."""
+    body = "".join(f"<tr><th>{i}</th><td>{i}</td><td>v</td></tr>" for i in range(5))
+    html = (
+        "<div><table><thead><tr><th></th><th>a</th><th>b</th></tr></thead>"
+        f"<tbody>{body}<tr><th>...</th><td>...</td><td>...</td></tr>"
+        "<tr><th>29657</th><td>29657</td><td>v</td></tr></tbody></table>"
+        "<p>29658 rows × 3 columns</p></div>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None
+    assert "showing 6 of 29,658 rows" in text
+
+
+def test_truncated_polars_preview_reports_full_size():
+    body = "".join(f"<tr><td>{i}</td></tr>" for i in range(4))
+    html = (
+        "<div><small>shape: (29_658, 1)</small>"
+        "<table><thead><tr><th>a</th></tr><tr><td>i64</td></tr></thead>"
+        f"<tbody>{body}<tr><td>&hellip;</td></tr><tr><td>29657</td></tr></tbody>"
+        "</table></div>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None
+    assert "showing 5 of 29,658 rows" in text
+
+
+def test_ellipsis_without_declared_total():
+    html = (
+        "<table><thead><tr><th>a</th></tr></thead>"
+        "<tbody><tr><td>1</td></tr><tr><td>…</td></tr><tr><td>9</td></tr></tbody></table>"
+    )
+    text = html_table_to_text(html)
+    assert text is not None
+    assert "showing 2 rows of a longer table (total unknown)" in text
+
+
+def test_header_only_table_falls_back_to_raw_count():
+    html = "<table><tr><th>a</th></tr><tr><th>b</th></tr></table>"
+    text = html_table_to_text(html)
+    assert text is not None and "2 rows" in text
+
+
 def test_mime_bundle_prefers_table_over_plain():
     html = "<table><tr><th>x</th></tr><tr><td>1</td></tr></table>"
     out = condense_outputs(
