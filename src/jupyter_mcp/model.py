@@ -74,6 +74,24 @@ class CellRef:
         return source_rev(self.cell.source)
 
 
+_NAME_RE = re.compile(r"[a-z0-9][a-z0-9-]*")
+#: auto-generated cell ids are hex (nbformat: uuid4().hex[:8]) or full UUIDs —
+#: pure hex-and-hyphens carries no meaning worth adopting as a name
+_GENERATED_ID_RE = re.compile(r"[0-9a-f-]+")
+
+
+def _adoptable_id(cell: NotebookNode) -> str | None:
+    """A human-meaningful cell id worth adopting as the cell's name.
+
+    Notebooks authored elsewhere often carry deliberate ids (`fetch-gtfs`);
+    addressing must honor those instead of synthesizing names from content.
+    """
+    cid = str(cell.get("id", "") or "")
+    if not _NAME_RE.fullmatch(cid) or _GENERATED_ID_RE.fullmatch(cid):
+        return None
+    return cid
+
+
 def _auto_name(cell: NotebookNode, index: int) -> str:
     """Derive a name from content: first md heading / first comment, else id."""
     source = cell.get("source", "")
@@ -157,6 +175,10 @@ class NotebookFile:
     def _ensure_names(self) -> bool:
         """Assign auto-names to unnamed cells. Returns True if any were added.
 
+        Prefers the cell's own ipynb id when it is human-meaningful (see
+        _adoptable_id) so externally-authored notebooks stay addressable by
+        the ids visible in the file; synthesizes from content otherwise.
+
         Does not write to disk — a foreign notebook is only rewritten once the
         first real mutation happens.
         """
@@ -165,7 +187,7 @@ class NotebookFile:
         for i, cell in enumerate(self.nb.cells):
             name = cell_name(cell)
             if not name:
-                name = _auto_name(cell, i)
+                name = _adoptable_id(cell) or _auto_name(cell, i)
                 changed = True
             base, n = name, 2
             while name in seen:

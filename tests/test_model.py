@@ -35,6 +35,46 @@ def test_auto_names_from_comments_and_headings(make_notebook):
     assert len(set(names)) == len(names)
 
 
+def test_meaningful_cell_ids_adopted_as_names(make_notebook):
+    """Feedback: notebooks authored elsewhere carry deliberate ids
+    (fetch-gtfs) — addressing must honor them, not synthesize from content."""
+    import json
+
+    path = make_notebook(
+        [
+            ("code", "import polars as pl"),
+            ("code", "gtfs = fetch()"),
+            ("code", "x = 1"),
+            ("code", "y = 2"),
+        ]
+    )
+    raw = json.loads(path.read_text())
+    raw["cells"][0]["id"] = "imports"  # meaningful single word
+    raw["cells"][1]["id"] = "fetch-gtfs"  # meaningful kebab-case
+    raw["cells"][2]["id"] = "6b71d8c6"  # nbformat auto id (hex) — skip
+    raw["cells"][3]["id"] = "a1b2c3d4-e5f6-7890-abcd-ef1234567890"  # uuid — skip
+    path.write_text(json.dumps(raw))
+
+    names = load(path).names()
+    assert names[0] == "imports"
+    assert names[1] == "fetch-gtfs"
+    assert names[2] == "x-1"  # content-derived, not the hex id
+    assert names[3] == "y-2"
+
+
+def test_adopted_id_colliding_with_existing_name_deduped(make_notebook):
+    # (nbformat corrects duplicate *ids* to random hex on load itself, so the
+    # collision that can actually reach us is id vs. stored metadata name)
+    import json
+
+    path = make_notebook([("code", "a = 1"), ("code", "b = 2")])
+    raw = json.loads(path.read_text())
+    raw["cells"][0]["metadata"]["jupyter_mcp"] = {"name": "setup"}
+    raw["cells"][1]["id"] = "setup"
+    path.write_text(json.dumps(raw))
+    assert load(path).names() == ["setup", "setup-2"]
+
+
 def test_rev_changes_with_source(make_notebook):
     nbf = load(make_notebook([("code", "x = 1")]))
     ref = nbf.refs()[0]
