@@ -21,10 +21,10 @@ from mcp.server.fastmcp import FastMCP, Image
 from .condense import condense_outputs
 from .dag import NotebookGraph
 from .errors import JupyterMcpError
-from .kernel import DEFAULT_EXEC_TIMEOUT, inspect_code
+from .kernel import DEFAULT_EXEC_TIMEOUT, find_project_python, inspect_code, resolve_kernel_name
 from .model import META_NS, CellRef, cell_meta
 from .session import CellResult, NotebookSession, Registry
-from .summaries import get_summary, get_tldr, output_hash
+from .summaries import get_summary, get_tldr, output_hash, summary_marker
 
 mcp = FastMCP("jupyter-eda")
 registry = Registry()
@@ -114,8 +114,12 @@ def _render_cell(
             condensed = condense_outputs(running.buffer.snapshot())
             lines.append(f"output (running for {running.elapsed():.0f}s — so far):")
         else:
-            condensed = condense_outputs(ref.cell.get("outputs", []))
-            lines.append("output:")
+            outputs = ref.cell.get("outputs", [])
+            condensed = condense_outputs(outputs)
+            if outputs and ref.name in stale:
+                lines.append("output (from a previous run — cell is stale):")
+            else:
+                lines.append("output:")
         lines.append(condensed.text)
         images = [Image(data=png, format="png") for png in condensed.images]
     return "\n".join(lines), images
@@ -165,7 +169,19 @@ def _mutation_footer(session: NotebookSession, focus: str | None = None) -> str:
 def create_notebook(path: str, kernel_name: str = "python3") -> str:
     """Create a new empty notebook at `path` (must not exist yet)."""
     session = registry.register_new(path, kernel_name)
-    return f"Created {session.path} (kernel: {kernel_name})."
+    # surface what the kernelspec will actually resolve to — invisible until
+    # first execution otherwise, and reassuring to see up front
+    if kernel_name in ("", "python3"):
+        python = find_project_python(session.path)
+        resolution = (
+            f"will run on the project venv: {python}"
+            if python is not None
+            else "no project venv with ipykernel found nearby; will use the 'python3' kernelspec"
+        )
+    else:
+        resolved, note = resolve_kernel_name(kernel_name)
+        resolution = note or f"will use kernelspec {resolved!r}"
+    return f"Created {session.path} (kernel: {kernel_name} — {resolution})."
 
 
 @mcp.tool()
@@ -221,8 +237,9 @@ def configure_notebook(
 def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
     """Index of the notebook: one line per cell (index, name, revision,
     staleness, one-line summary) plus dependency edges and lint findings.
-    Start here when opening a notebook. Summaries marked with * are
-    deterministic fallbacks, not LLM-generated."""
+    Start here when opening a notebook. Summary markers: ~ = LLM-generated
+    (approximate — verify exact numbers against the cell itself), * =
+    deterministic fallback (first comment/heading line)."""
     session = registry.get(path)
     session.refresh_reads()
     graph = session.graph()
@@ -596,12 +613,15 @@ def undo_last(path: str) -> str:
 @mcp.tool()
 @_tool_errors
 def summarize_cells(path: str, names: list[str] | None = None, include_outputs: bool = True) -> str:
-    """Detailed summaries (LLM): per-cell description plus, optionally, a
-    summary of each cell's current output. Cheaper than reading full cells
-    when orienting in a large notebook."""
+    """Detailed summaries: per-cell description plus, optionally, a summary
+    of each cell's current output. Cheaper than reading full cells when
+    orienting in a large notebook. Summaries marked ~ are LLM-generated —
+    approximate by nature, so verify exact numbers against the cell itself;
+    * marks deterministic fallbacks (first comment/heading line)."""
     session = registry.get(path)
     session.refresh_reads()
     graph = session.graph()
+    stale = set(session.stale_names(graph))
     result = session.summarizer.refresh(session.nbfile, graph, names)
     notices = [result.notice] if result.notice else []
     if include_outputs:
@@ -620,9 +640,10 @@ def summarize_cells(path: str, names: list[str] | None = None, include_outputs: 
     lines = []
     for ref in _select_refs(session, names, None):
         summ = get_summary(ref.cell)
-        lines.append(f"[{ref.index}] {ref.name} (rev {ref.rev})")
+        stale_flag = "; STALE" if ref.name in stale else ""
+        lines.append(f"[{ref.index}] {ref.name} (rev {ref.rev}{stale_flag})")
         if summ:
-            lines.append(f"  {summ['tldr']}")
+            lines.append(f"  {summ['tldr']}{summary_marker(summ)}")
             if summ.get("description"):
                 lines.append(f"  {summ['description']}")
         else:
@@ -632,7 +653,12 @@ def summarize_cells(path: str, names: list[str] | None = None, include_outputs: 
             # only show a summary that describes the CURRENT outputs
             current = condense_outputs(ref.cell.outputs).text
             if out_summ.get("output_hash") == output_hash(current):
-                lines.append(f"  output: {out_summ['text']}")
+                label = (
+                    "output (from a previous run — cell is stale)"
+                    if ref.name in stale
+                    else "output"
+                )
+                lines.append(f"  {label}: {out_summ['text']} ~")
     if notices:
         lines.append("")
         lines.extend(f"note: {n}" for n in dict.fromkeys(notices))

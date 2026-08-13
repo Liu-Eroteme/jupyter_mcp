@@ -47,3 +47,27 @@ def test_fallback_summaries_are_retried_once_llm_returns(tmp_path, monkeypatch):
 
     # up-to-date LLM summaries are never re-requested
     assert working.dirty_cells(nbf) == []
+
+
+def test_tldr_provenance_markers(tmp_path):
+    """Feedback: LLM summaries can be subtly wrong — mark them approximate
+    (~), keep * for deterministic fallbacks."""
+    from jupyter_mcp.model import cell_meta, source_rev
+    from jupyter_mcp.summaries import get_tldr
+
+    nbf, graph = _notebook(tmp_path)
+    cell = nbf.get("calc").cell
+
+    # no stored summary: deterministic fallback, starred
+    assert get_tldr(cell).endswith(" *")
+
+    cell_meta(cell)["summary"] = {
+        "code_rev": source_rev(cell.source),
+        "tldr": "sets x to 1",
+        "description": "",
+        "source": "llm",
+    }
+    assert get_tldr(cell) == "sets x to 1 ~"
+
+    cell_meta(cell)["summary"]["source"] = "fallback"
+    assert get_tldr(cell) == "sets x to 1 *"

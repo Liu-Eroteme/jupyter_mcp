@@ -239,7 +239,10 @@ def test_output_summary_shown_only_when_hash_matches(nb):
         "source": "llm",
     }
     session.nbfile.save()
-    assert "output: RIGHT" in server.summarize_cells(str(nb), names=["calc"])
+    out = server.summarize_cells(str(nb), names=["calc"])
+    # the cell never ran on a live kernel, so its outputs are honestly
+    # labeled as previous-run data — and LLM text carries the ~ marker
+    assert "output (from a previous run — cell is stale): RIGHT ~" in out
 
 
 def test_kernel_startup_failure_surfaces_in_results(nb, monkeypatch):
@@ -583,6 +586,51 @@ def test_notebook_default_wait_applies(nb):
     while session.busy() and _time.monotonic() < deadline:
         _time.sleep(0.2)
     assert not session.busy()
+
+
+def test_stale_cell_outputs_labeled_in_read_and_summaries(nb):
+    """Feedback: after external edits, cached outputs/summaries survived
+    without any hint that they predate the current code."""
+    import nbformat
+
+    server.add_cell(str(nb), "calc", "print('v2')")
+    session = server.registry.get(str(nb))
+    ref = session.nbfile.get("calc")
+    ref.cell.outputs = [nbformat.v4.new_output("stream", name="stdout", text="v1\n")]
+    session.nbfile.save()
+
+    blocks = server.read_cells(str(nb), names=["calc"])
+    text = "\n".join(b for b in blocks if isinstance(b, str))
+    assert "output (from a previous run — cell is stale):" in text
+
+    summary = server.summarize_cells(str(nb), names=["calc"], include_outputs=False)
+    assert "STALE" in summary
+
+
+@pytest.mark.kernel
+def test_fresh_cell_outputs_not_stale_labeled(nb):
+    server.add_cell(str(nb), "calc", "print('now')")
+    server.run(str(nb))
+    blocks = server.read_cells(str(nb), names=["calc"])
+    text = "\n".join(b for b in blocks if isinstance(b, str))
+    assert "output:" in text and "previous run" not in text
+
+
+def test_create_notebook_reports_kernel_resolution(tmp_path, monkeypatch):
+    """Feedback: which interpreter 'python3' resolves to was invisible until
+    the first run; surface it at creation."""
+    from jupyter_mcp import kernel as kernel_mod
+    from jupyter_mcp import server as server_mod
+
+    out = server.create_notebook(str(tmp_path / "plain.ipynb"))
+    assert "no project venv" in out and "'python3' kernelspec" in out
+
+    fake = tmp_path / ".venv" / "bin" / "python"
+    fake.parent.mkdir(parents=True)
+    fake.touch()
+    monkeypatch.setattr(kernel_mod, "_has_ipykernel", lambda python: True)
+    out = server_mod.create_notebook(str(tmp_path / "proj.ipynb"))
+    assert f"will run on the project venv: {fake}" in out
 
 
 # ------------------------------------------- round 5: codex review findings

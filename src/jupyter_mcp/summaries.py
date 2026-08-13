@@ -83,10 +83,17 @@ def get_summary(cell) -> dict | None:
     return None
 
 
+def summary_marker(summ: dict | None) -> str:
+    """Provenance marker: ' *' deterministic fallback, ' ~' LLM (approximate)."""
+    if summ is None or summ.get("source") == "fallback":
+        return " *"
+    return " ~"
+
+
 def get_tldr(cell) -> str:
     summ = get_summary(cell)
     if summ:
-        return summ["tldr"]
+        return summ["tldr"] + summary_marker(summ)
     return fallback_tldr(cell.cell_type, cell.source) + " *"
 
 
