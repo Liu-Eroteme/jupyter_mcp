@@ -44,6 +44,7 @@ This server fixes each of those with an opinionated data model.
 | `undo_last` | Restore pre-mutation snapshot |
 | `summarize_cells` | Detailed LLM summaries incl. outputs |
 | `search_cells` | Search source + names + summaries |
+| `kb_search` / `kb_get` / `kb_upsert` | Knowledge bundle: durable notes about data sources, tooling, recipes (see below) |
 
 ## Setup
 
@@ -71,6 +72,22 @@ metadata, falling back to `python3`. Kernels idle longer than 30 minutes are
 shut down lazily (`JUPYTER_MCP_KERNEL_TTL_SECONDS` overrides); the next
 execution restarts them, and epoch-scoped staleness handles the rest. On
 POSIX, kernels connect over IPC sockets (no open TCP ports).
+
+### Knowledge base
+
+Durable notes that outlive a session — data-source caveats (units, join
+keys, quirks), internal tooling, known-good recipes — live in an
+[OKF v0.1](https://github.com/GoogleCloudPlatform/knowledge-catalog/tree/main/okf)
+bundle: a plain directory of markdown files with YAML frontmatter,
+shareable as a git repo, reviewable via PRs, greppable with no tooling.
+
+Point `JUPYTER_MCP_KB_PATH` at the bundle directory (or pass `bundle`
+per call). `kb_upsert` creates it on first write and appends every
+change to the bundle's `log.md`. Entries with a `resource` URI (file
+glob, table name, package) are automatically crossref'd into
+`notebook_overview`: cells whose code touches a known source get a
+`kb:` line pointing at the entry, so caveats resurface exactly when a
+notebook starts reading that data.
 
 ### Summaries & credentials
 

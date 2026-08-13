@@ -17,6 +17,11 @@ and the phase-2 spec for the OKF knowledge base.
 
 ## Phase 2 — OKF knowledge base
 
+> **Status: implemented 2026-08-13** (`kb.py`, tools `kb_search` /
+> `kb_get` / `kb_upsert`, overview crossref via `JUPYTER_MCP_KB_PATH`).
+> Deviations from the sketch: MCP-resource exposure skipped (nothing
+> consumes it yet); matching is plain word/glob matching as planned.
+
 Goal: agents (and data scientists) accrete durable notes about **data
 sources**, **internal tooling**, and **recipes** across notebooks, so the
 next session doesn't rediscover what the last one learned (units, caveats,

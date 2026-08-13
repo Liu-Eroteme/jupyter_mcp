@@ -11,6 +11,7 @@ Conventions:
 from __future__ import annotations
 
 import functools
+import os
 import re
 import sys
 import traceback
@@ -18,6 +19,7 @@ from typing import Any
 
 from mcp.server.fastmcp import FastMCP, Image
 
+from . import kb as kb_mod
 from .condense import condense_outputs
 from .dag import NotebookGraph
 from .errors import JupyterMcpError
@@ -145,6 +147,24 @@ def _select_refs(
         end = int(m.group(2)) if m.group(2) else None
         return refs[start:end]
     return refs
+
+
+def _kb_crossref(session: NotebookSession) -> list[str]:
+    """Knowledge-bundle hits for this notebook's code — the hook that makes
+    the KB pay off (see ROADMAP). Env-configured bundles only; any failure
+    must never break the overview."""
+    if not os.environ.get(kb_mod.KB_ENV):
+        return []
+    try:
+        entries = kb_mod.load_bundle(kb_mod.resolve_bundle(None))
+        cells = [
+            (r.name, r.cell.source)
+            for r in session.nbfile.refs()
+            if r.cell.cell_type == "code"
+        ]
+        return kb_mod.crossref(entries, cells)
+    except Exception:
+        return []
 
 
 def _mutation_footer(session: NotebookSession, focus: str | None = None) -> str:
@@ -291,6 +311,7 @@ def notebook_overview(path: str, refresh_summaries: bool = True) -> str:
     for name, deps in graph.deps.items():
         if deps.parse_error:
             footer.append(f"lint {name}: syntax error ({deps.parse_error})")
+    footer.extend(_kb_crossref(session))
     if notice:
         footer.append(f"note: {notice}")
     if footer:
@@ -697,6 +718,88 @@ def search_cells(path: str, query: str, regex: bool = False) -> str:
         if matches:
             hits.append(f"[{ref.index}] {ref.name} (rev {ref.rev})\n" + "\n".join(matches))
     return "\n\n".join(hits) if hits else f"No matches for {query!r}."
+
+
+# ------------------------------------------------------------ knowledge base
+
+
+@mcp.tool()
+@_tool_errors
+def kb_search(
+    query: str,
+    type: str | None = None,
+    tag: str | None = None,
+    bundle: str | None = None,
+) -> str:
+    """Search the knowledge bundle — durable notes about data sources,
+    internal tooling, and recipes, accreted across notebooks and sessions.
+    Check here before EDA on an unfamiliar source: units, caveats, join keys
+    live here. Plain word matching over frontmatter + body; `type` filters
+    (Data Source | Tool | Recipe), as does `tag`. The bundle directory comes
+    from `bundle` or the JUPYTER_MCP_KB_PATH env var."""
+    root = kb_mod.resolve_bundle(bundle)
+    hits = kb_mod.search(kb_mod.load_bundle(root), query, type=type, tag=tag)
+    if not hits:
+        filters = "".join(f", {k}={v}" for k, v in (("type", type), ("tag", tag)) if v)
+        return f"No KB entries match {query!r}{filters} in {root}."
+    lines = []
+    for hit in hits[:10]:
+        e = hit.entry
+        header = f"{e.rel_path} ({e.type}) — {e.title}"
+        if e.resource:
+            header += f" [resource: {e.resource}]"
+        lines.append(header)
+        if e.description:
+            lines.append(f"  {e.description}")
+        lines.extend(f"  > {ml}" for ml in hit.matching_lines)
+    if len(hits) > 10:
+        lines.append(f"… and {len(hits) - 10} more — narrow the query or filter.")
+    lines.append("(kb_get a path for the full entry)")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+@_tool_errors
+def kb_get(path: str, bundle: str | None = None) -> str:
+    """Read one knowledge-bundle entry in full (frontmatter + body)."""
+    root = kb_mod.resolve_bundle(bundle)
+    e = kb_mod.get_entry(root, path)
+    meta = "\n".join(f"{k}: {v}" for k, v in e.meta.items())
+    return f"# {e.rel_path}\n{meta}\n\n{e.body.strip()}"
+
+
+@mcp.tool()
+@_tool_errors
+def kb_upsert(
+    path: str,
+    type: str,
+    title: str | None = None,
+    description: str | None = None,
+    resource: str | None = None,
+    tags: list[str] | None = None,
+    body: str | None = None,
+    bundle: str | None = None,
+) -> str:
+    """Create or update a knowledge-bundle entry. Record durable facts worth
+    re-finding: data-source caveats (units, quirks, join keys), internal
+    tooling install/usage, known-good recipes. Update-don't-duplicate: `path`
+    (bundle-relative, e.g. 'data-sources/omniplus') is the key; omitted
+    fields keep their existing values. `resource` is the canonical URI (file
+    glob, table name, package) used to crossref entries into
+    notebook_overview automatically. Writes are logged to the bundle's
+    log.md."""
+    root = kb_mod.resolve_bundle(bundle, create=True)
+    entry, created = kb_mod.upsert(
+        root,
+        path,
+        type=type,
+        title=title,
+        description=description,
+        resource=resource,
+        tags=tags,
+        body=body,
+    )
+    return f"{'Created' if created else 'Updated'} {entry.rel_path} in bundle {root}."
 
 
 def main() -> None:
