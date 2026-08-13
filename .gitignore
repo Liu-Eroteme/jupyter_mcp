@@ -16,3 +16,7 @@ build/
 
 # local
 .env
+
+# testing area
+test_area/
+.mcp.json
